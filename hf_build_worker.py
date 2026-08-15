@@ -115,6 +115,7 @@ def report_progress(stage: str, percent: int, message: str = "", force: bool = F
     try:
         requests.post(CALLBACK_URL, json={
             "build_id": BUILD_ID,
+            "file_id":  FILE_ID,
             "secret":   CALLBACK_SECRET,
             "stage":    stage,
             "percent":  min(percent, 100),
@@ -130,6 +131,7 @@ def report_error(message: str):
     try:
         requests.post(CALLBACK_URL, json={
             "build_id": BUILD_ID,
+            "file_id":  FILE_ID,
             "secret":   CALLBACK_SECRET,
             "stage":    "error",
             "percent":  0,
@@ -145,6 +147,7 @@ def report_complete(hf_url: str, file_size: int):
     try:
         requests.post(CALLBACK_URL, json={
             "build_id": BUILD_ID,
+            "file_id":  FILE_ID,
             "secret":   CALLBACK_SECRET,
             "stage":    "complete",
             "percent":  100,
@@ -449,7 +452,9 @@ def process_zip(source_path: str, output_path: str) -> dict:
         # Detect common top-level folder prefix (for flattening)
         prefix = detect_common_prefix(entries)
 
-        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_STORED) as out_zip:
+        CHUNK_SIZE = 64 * 1024 * 1024  # 64MB — memory stays flat regardless of entry size
+
+        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_STORED, allowZip64=True) as out_zip:
             for entry in entries:
                 name = entry.filename
 
@@ -468,11 +473,17 @@ def process_zip(source_path: str, output_path: str) -> dict:
                     print(f"  Excluded: {flat_name}")
                     continue
 
-                # Copy entry to output
-                data = src_zip.read(entry.filename)
-                out_zip.writestr(flat_name, data)
+                # Stream entry to output in chunks — never buffers full file
+                with src_zip.open(entry, "r") as src, \
+                     out_zip.open(flat_name, "w", force_zip64=True) as dst:
+                    while True:
+                        chunk = src.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+
                 stats["kept"] += 1
-                stats["total_size"] += len(data)
+                stats["total_size"] += entry.file_size
 
             # Add watermark files at root
             out_zip.writestr(f"Downloaded from {BRAND_NAME}.txt", WATERMARK_BRAND)
