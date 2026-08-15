@@ -1,0 +1,60 @@
+name: PVL Build & Cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_id:
+        description: 'Google Drive file ID'
+        required: true
+      file_name:
+        description: 'Original filename'
+        required: true
+      callback_url:
+        description: 'WordPress progress callback URL'
+        required: true
+      build_id:
+        description: 'Unique build ID for progress tracking'
+        required: true
+      exclude_patterns:
+        description: 'Newline-separated glob patterns to exclude'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install guzzle-sphinx-theme requests PyJWT cryptography huggingface-hub
+
+      - name: Write SA credentials
+        run: echo '${{ secrets.SA_CREDENTIALS_JSON }}' > /tmp/sa_credentials.json
+
+      - name: Run build worker
+        env:
+          SA_CREDENTIALS_PATH: /tmp/sa_credentials.json
+          GAS_BRIDGE_URL: ${{ secrets.GAS_BRIDGE_URL }}
+          GAS_BRIDGE_SECRET: ${{ secrets.GAS_BRIDGE_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: adminlexzytech/phone-firmware
+          BUILD_CALLBACK_SECRET: ${{ secrets.BUILD_CALLBACK_SECRET }}
+          FILE_ID: ${{ inputs.file_id }}
+          FILE_NAME: ${{ inputs.file_name }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          BUILD_ID: ${{ inputs.build_id }}
+          EXCLUDE_PATTERNS: ${{ inputs.exclude_patterns }}
+        run: python hf_build_worker.py
+
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f /tmp/sa_credentials.json
