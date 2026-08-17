@@ -358,6 +358,7 @@ def stream_download(url: str, dest_path: str, auth: str = None, params: dict = N
 
     resp = requests.get(url, headers=headers, params=params, stream=True, timeout=30, allow_redirects=True)
 
+    # Reject obvious HTML error pages (Google returns 200 + text/html for quota errors)
     content_type = resp.headers.get("Content-Type", "")
     if "text/html" in content_type:
         snippet = resp.content[:500].decode("utf-8", errors="replace")
@@ -377,8 +378,19 @@ def stream_download(url: str, dest_path: str, auth: str = None, params: dict = N
                                 f"Downloaded {downloaded // (1024*1024)} / {total // (1024*1024)} MB")
 
     size = os.path.getsize(dest_path)
-    if size < 100:
-        print(f"  Download too small: {size} bytes")
+
+    # Check if it's actually HTML despite the Content-Type header lying
+    with open(dest_path, "rb") as f:
+        head = f.read(256)
+    if b"<!DOCTYPE" in head or b"<html" in head or b"Quota exceeded" in head:
+        snippet = head[:200].decode("utf-8", errors="replace")
+        print(f"  Download is HTML despite Content-Type ({content_type}): {snippet[:150]}")
+        os.unlink(dest_path)
+        return False
+
+    # Reject suspiciously small files (any real firmware ZIP is at least several MB)
+    if size < 1024:
+        print(f"  Download too small: {size} bytes (expected a real file, not an error page)")
         os.unlink(dest_path)
         return False
 
@@ -620,13 +632,20 @@ def main():
         report_progress("processing", 85,
                         f"Processing complete ({processed_size // (1024*1024)} MB)", force=True)
 
+        # Sanity check: a ZIP with only watermarks and no real content is ~3-4KB.
+        # Any real firmware file produces at least several MB. If we got less than
+        # 10KB, the download was garbage and we'd be poisoning the cache.
+        if processed_size < 10240:
+            report_error(f"Processed ZIP is only {processed_size} bytes — source download was likely corrupt or empty. Aborting.")
+            sys.exit(1)
+
         # ─── Step 4: Build the HF filename ───
-        # Format: {fileId}_{branded_name}.zip
+        # Format: {fileId}/branded_name.zip
         base_name = os.path.splitext(original_name)[0]
         # Strip existing branding if present
-        for strip in ["— lexzytechinc.com", "- lexzytechinc.com", "lexzytechinc.com"]:
+        for strip in [" - lexzytechinc.com", "- lexzytechinc.com", "lexzytechinc.com"]:
             base_name = base_name.replace(strip, "").strip()
-        branded_name = f"{base_name} — {BRAND_NAME}.zip"
+        branded_name = f"{base_name} - {BRAND_NAME}.zip"
         # HF filename uses fileId prefix for uniqueness
         hf_filename = f"{FILE_ID}/{branded_name}"
 
