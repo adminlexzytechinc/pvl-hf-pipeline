@@ -102,6 +102,86 @@ WATERMARK_README = (
 
 
 # ─────────────────────────────────────────────
+#  Watermark Cleaning (ported from core.firmware.php → firmware_clean_filename)
+# ─────────────────────────────────────────────
+
+import re as _re
+
+def clean_watermarks(filename: str) -> str:
+    """Strip third-party site watermarks from firmware filenames.
+
+    Mirrors the PHP firmware_clean_filename() patterns so files
+    uploaded to HF have clean names regardless of source site.
+    """
+    c = filename
+
+    # [Hovatek], [NaijaROM], [FirmwareFile], [up_addROM.com]_, etc. at start
+    c = _re.sub(
+        r'^\[(?:Hovatek|NaijaROM|FirmwareFile|XDAFirmware|up_addROM\.com|addROM\.com|'
+        r'MobiFirmware|Firmware4mobile|Repairmymobile|FirmwareOS|HardReset\.info|MobileGuru4)\]\s*_?',
+        '', c, flags=_re.I)
+
+    # _[HardReset.info] suffix anywhere
+    c = _re.sub(r'_?\[HardReset\.info\]', '', c, flags=_re.I)
+
+    # Leading site prefix: up_addROM.com_ or similar (BEFORE standalone replacement)
+    c = _re.sub(
+        r'^(?:up_)?(?:addROM|TecnoFirmware|NaijaROM|FirmwareFile|MobiFirmware|'
+        r'Firmware4mobile|Firmware4mobiles|Repairmymobile|RepairMyMobile|FirmwareOS|'
+        r'HardReset|MobileGuru4)\.(?:com|net|org|co|in|info)[_\s-]*',
+        '', c, flags=_re.I)
+
+    # _by_(FirmwareOS.com) -- specific pattern BEFORE general parens removal
+    c = _re.sub(r'_?by_?\(?FirmwareOS(?:\.com)?\)?', '', c, flags=_re.I)
+
+    # _by_SiteName.Com suffix
+    c = _re.sub(r'_by_[a-zA-Z0-9]+\.(?:com|net|org)', '', c, flags=_re.I)
+
+    # Site names in parentheses: (MobiFirmware.com), (by_NaijaROM.Com), (firmwarefile.com), etc.
+    c = _re.sub(r'\([^)]*\.(?:com|net|org|io|co|in|info)[^)]*\)', '', c, flags=_re.I)
+
+    # Parenthesized by-watermarks even without .com: _(by_SiteName), _(by_NaijaROM)
+    c = _re.sub(r'_?\(by[_\s][^)]*\)', '', c, flags=_re.I)
+
+    # Standalone site name references (non-parenthesized)
+    c = _re.sub(
+        r'[\s_-]*(?:addROM|TecnoFirmware|NaijaROM|FirmwareFile|MobiFirmware|XDAFirmware|'
+        r'Firmware4mobile|Firmware4mobiles|Repairmymobile|RepairMyMobile|FirmwareOS|'
+        r'HardReset|MobileGuru4)\.(?:com|net|org|co|in|info)[\s_-]*',
+        '_', c, flags=_re.I)
+
+    # _by_AnySiteName before .zip/.rar/.7z/.pac extension
+    c = _re.sub(r'_by_[a-zA-Z0-9_]+(?=\.(?:zip|rar|7z|pac)$)', '', c, flags=_re.I)
+
+    # _Repairmymobile / _ RepairMyMobile.in suffix before extension
+    c = _re.sub(r'[\s_-]+Repairmymobile(?:\.(?:co|in))?(?=\.(?:zip|rar|7z|pac)$)', '', c, flags=_re.I)
+
+    # _RMM suffix (RepairMyMobile abbreviation)
+    c = _re.sub(r'_?RMM(?=\.(?:zip|rar|7z|pac)$)', '', c, flags=_re.I)
+
+    # _Firmware4mobile suffix before extension
+    c = _re.sub(r'_?Firmware4mobiles?(?=\.(?:zip|rar|7z|pac)$)', '', c, flags=_re.I)
+
+    # _MobileGuru4.com / _MobileGuru4 suffix before extension
+    c = _re.sub(r'_?MobileGuru4(?:\.com)?(?=\.(?:zip|rar|7z|pac)$)', '', c, flags=_re.I)
+
+    # Catch-all: trailing _by or _by_ left behind after other removals
+    c = _re.sub(r'[_\s-]+by[_\s]*(?=\.(?:zip|rar|7z|pac)$)', '', c, flags=_re.I)
+
+    # Cleanup: double underscores/dashes
+    c = _re.sub(r'_{2,}', '_', c)
+    c = _re.sub(r'-{2,}', '-', c)
+
+    # Trailing underscore/dash before extension
+    c = _re.sub(r'[_-]+\.(?=zip|rar|7z|pac)', '.', c, flags=_re.I)
+
+    # Leading underscore/dash
+    c = _re.sub(r'^[_-]+', '', c)
+
+    return c.strip()
+
+
+# ─────────────────────────────────────────────
 #  Progress Reporting
 # ─────────────────────────────────────────────
 
@@ -641,11 +721,16 @@ def main():
 
         # ─── Step 4: Build the HF filename ───
         # Format: {fileId}/branded_name.zip
-        base_name = os.path.splitext(original_name)[0]
+        # First strip third-party site watermarks from the source filename
+        cleaned_name = clean_watermarks(original_name)
+        base_name = os.path.splitext(cleaned_name)[0]
         # Strip existing branding if present
         for strip in [" - lexzytechinc.com", "- lexzytechinc.com", "lexzytechinc.com"]:
             base_name = base_name.replace(strip, "").strip()
         branded_name = f"{base_name} - {BRAND_NAME}.zip"
+        print(f"  Original name: {original_name}")
+        print(f"  Cleaned name:  {cleaned_name}")
+        print(f"  Branded name:  {branded_name}")
         # HF filename uses fileId prefix for uniqueness
         hf_filename = f"{FILE_ID}/{branded_name}"
 
