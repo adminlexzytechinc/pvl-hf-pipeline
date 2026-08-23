@@ -1,4 +1,4 @@
-name: PVL Build & Cache
+name: PVL HF Build Worker
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
         description: 'Google Drive file ID'
         required: true
       file_name:
-        description: 'Original filename'
+        description: 'Original filename (clean, no watermarks)'
         required: true
       callback_url:
         description: 'WordPress progress callback URL'
@@ -19,6 +19,14 @@ on:
         description: 'Newline-separated glob patterns to exclude'
         required: false
         default: ''
+      hf_repo_slug:
+        description: 'Target repo slug from pool config (e.g., fw-1, iso-1)'
+        required: false
+        default: ''
+      hf_repo_id:
+        description: 'Full HF repo ID (e.g., adminlexzytech/phone-firmware)'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -26,35 +34,59 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install guzzle-sphinx-theme requests PyJWT cryptography huggingface-hub
+        run: pip install -r requirements.txt
 
-      - name: Write SA credentials
-        run: echo '${{ secrets.SA_CREDENTIALS_JSON }}' > /tmp/sa_credentials.json
+      - name: Extract HF token for target repo
+        id: get-token
+        env:
+          SLUG: ${{ inputs.hf_repo_slug }}
+          HF_ACCOUNTS_JSON: ${{ secrets.HF_ACCOUNTS }}
+          FALLBACK_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -n "$SLUG" ] && [ -n "$HF_ACCOUNTS_JSON" ]; then
+            TOKEN=$(echo "$HF_ACCOUNTS_JSON" | python3 -c "import json,sys; a=json.load(sys.stdin); print(a.get('$SLUG',''))")
+            if [ -n "$TOKEN" ]; then
+              echo "::add-mask::$TOKEN"
+              echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+              echo "Found token for repo slug: $SLUG"
+            else
+              echo "No token for slug $SLUG, using fallback"
+              echo "::add-mask::$FALLBACK_TOKEN"
+              echo "token=$FALLBACK_TOKEN" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Using legacy HF_TOKEN"
+            echo "::add-mask::$FALLBACK_TOKEN"
+            echo "token=$FALLBACK_TOKEN" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine HF repo ID
+        id: get-repo
+        run: |
+          if [ -n "${{ inputs.hf_repo_id }}" ]; then
+            echo "repo_id=${{ inputs.hf_repo_id }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "repo_id=adminlexzytech/phone-firmware" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Run build worker
         env:
-          SA_CREDENTIALS_PATH: /tmp/sa_credentials.json
-          GAS_BRIDGE_URL: ${{ secrets.GAS_BRIDGE_URL }}
-          GAS_BRIDGE_SECRET: ${{ secrets.GAS_BRIDGE_SECRET }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_REPO_ID: adminlexzytech/phone-firmware
-          BUILD_CALLBACK_SECRET: ${{ secrets.BUILD_CALLBACK_SECRET }}
           FILE_ID: ${{ inputs.file_id }}
           FILE_NAME: ${{ inputs.file_name }}
+          HF_REPO_ID: ${{ steps.get-repo.outputs.repo_id }}
+          HF_TOKEN: ${{ steps.get-token.outputs.token }}
           CALLBACK_URL: ${{ inputs.callback_url }}
+          CALLBACK_SECRET: ${{ secrets.BUILD_CALLBACK_SECRET }}
           BUILD_ID: ${{ inputs.build_id }}
           EXCLUDE_PATTERNS: ${{ inputs.exclude_patterns }}
+          GAS_BRIDGE_URL: ${{ secrets.GAS_BRIDGE_URL }}
         run: python hf_build_worker.py
-
-      - name: Cleanup credentials
-        if: always()
-        run: rm -f /tmp/sa_credentials.json
