@@ -43,7 +43,15 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests PyJWT cryptography huggingface-hub; fi
+
+      - name: Write SA credentials
+        env:
+          SA_JSON: ${{ secrets.SA_CREDENTIALS_JSON }}
+        run: |
+          echo "$SA_JSON" > /tmp/sa_credentials.json
 
       - name: Extract HF token for target repo
         id: get-token
@@ -53,7 +61,7 @@ jobs:
           FALLBACK_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           if [ -n "$SLUG" ] && [ -n "$HF_ACCOUNTS_JSON" ]; then
-            TOKEN=$(echo "$HF_ACCOUNTS_JSON" | python3 -c "import json,sys; a=json.load(sys.stdin); print(a.get('$SLUG',''))")
+            TOKEN=$(python3 -c "import os, json; accounts = json.loads(os.environ.get('HF_ACCOUNTS_JSON', '{}')); print(accounts.get(os.environ.get('SLUG', ''), ''))")
             if [ -n "$TOKEN" ]; then
               echo "::add-mask::$TOKEN"
               echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
@@ -80,13 +88,19 @@ jobs:
 
       - name: Run build worker
         env:
-          FILE_ID: ${{ inputs.file_id }}
-          FILE_NAME: ${{ inputs.file_name }}
+          SA_CREDENTIALS_PATH: /tmp/sa_credentials.json
+          GAS_BRIDGE_URL: ${{ secrets.GAS_BRIDGE_URL }}
+          GAS_BRIDGE_SECRET: ${{ secrets.GAS_BRIDGE_SECRET }}
+          BUILD_CALLBACK_SECRET: ${{ secrets.BUILD_CALLBACK_SECRET }}
           HF_REPO_ID: ${{ steps.get-repo.outputs.repo_id }}
           HF_TOKEN: ${{ steps.get-token.outputs.token }}
+          FILE_ID: ${{ inputs.file_id }}
+          FILE_NAME: ${{ inputs.file_name }}
           CALLBACK_URL: ${{ inputs.callback_url }}
-          CALLBACK_SECRET: ${{ secrets.BUILD_CALLBACK_SECRET }}
           BUILD_ID: ${{ inputs.build_id }}
           EXCLUDE_PATTERNS: ${{ inputs.exclude_patterns }}
-          GAS_BRIDGE_URL: ${{ secrets.GAS_BRIDGE_URL }}
         run: python hf_build_worker.py
+
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f /tmp/sa_credentials.json
