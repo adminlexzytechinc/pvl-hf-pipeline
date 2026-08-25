@@ -110,6 +110,20 @@ WATERMARK_README = (
 
 import re as _re
 
+def is_generic_filename(name: str) -> bool:
+    """Check if a filename is a generic placeholder (like 'file', 'download', etc.)."""
+    if not name:
+        return True
+    clean = name.strip().lower()
+    # Check exact generic words
+    if clean in ("download", "download.zip", "file", "file.zip", "raw_download", "raw_download.zip", "archive", "document", "none", "null"):
+        return True
+    # Strip extension and check base name
+    base = os.path.splitext(clean)[0]
+    if base in ("download", "file", "raw_download", "archive", "document", "none", "null"):
+        return True
+    return False
+
 def clean_watermarks(filename: str) -> str:
     """Strip third-party site watermarks from firmware filenames and archive entries.
     Mirrors firmware_clean_filename() from core.firmware.php.
@@ -369,17 +383,27 @@ def mediafire_download(file_id: str, dest_path: str) -> bool:
             print(f"  Could not extract direct download URL from MediaFire page: {page_url}")
             return False
 
-        # Extract original filename if not provided or generic
-        if not FILE_NAME or FILE_NAME in ("download", "download.zip"):
-            fn_match = re.search(r'<div[^>]+class=["\'][^"\']*(?:file-name|filename)[^"\']*["\'][^>]*>([^<]+)</div>', html, re.I)
-            if fn_match:
-                extracted_fn = fn_match.group(1).strip()
-                if extracted_fn:
-                    FILE_NAME = clean_watermarks(extracted_fn)
-            else:
-                url_fn = direct_url.split("/")[-1].split("?")[0]
-                if url_fn:
-                    FILE_NAME = clean_watermarks(urllib.parse.unquote(url_fn))
+        # Extract original filename from MediaFire HTML, direct URL, or SOURCE_URL
+        scraped_fn = None
+        fn_match = re.search(r'<div[^>]+class=["\'][^"\']*(?:file-name|filename)[^"\']*["\'][^>]*>([^<]+)</div>', html, re.I)
+        if fn_match:
+            scraped_fn = fn_match.group(1).strip()
+        
+        if not scraped_fn and direct_url:
+            url_fn = direct_url.split("/")[-1].split("?")[0]
+            if url_fn:
+                scraped_fn = urllib.parse.unquote(url_fn)
+
+        if not scraped_fn and SOURCE_URL:
+            src_parts = [p for p in SOURCE_URL.split("?")[0].split("/") if p and p.lower() != "file"]
+            if src_parts and "." in src_parts[-1]:
+                scraped_fn = urllib.parse.unquote(src_parts[-1])
+
+        if scraped_fn:
+            scraped_clean = clean_watermarks(scraped_fn)
+            if is_generic_filename(FILE_NAME) or ("." in scraped_clean and "." not in FILE_NAME):
+                FILE_NAME = scraped_clean
+                print(f"  Scraped MediaFire filename: {FILE_NAME}")
 
         print(f"  MediaFire direct download link found: {direct_url}")
         report_progress("downloading", 20, f"Downloading from MediaFire ({FILE_NAME})...")
@@ -391,10 +415,13 @@ def mediafire_download(file_id: str, dest_path: str) -> bool:
 
         # Check Content-Disposition for filename
         cd = dl_resp.headers.get("Content-Disposition", "")
-        if "filename=" in cd and (not FILE_NAME or FILE_NAME in ("download", "download.zip")):
+        if "filename=" in cd:
             cd_fn = re.search(r'filename=["\']?([^"\';]+)', cd)
             if cd_fn:
-                FILE_NAME = clean_watermarks(cd_fn.group(1).strip())
+                cd_name = clean_watermarks(cd_fn.group(1).strip())
+                if is_generic_filename(FILE_NAME) or ("." in cd_name and "." not in FILE_NAME):
+                    FILE_NAME = cd_name
+                    print(f"  Content-Disposition filename: {FILE_NAME}")
 
         total = int(dl_resp.headers.get("Content-Length", 0))
         downloaded = 0
@@ -887,8 +914,15 @@ def main():
             sys.exit(1)
 
         # If download resolved a better filename (e.g. MediaFire scraped name), update original_name
-        if FILE_NAME and FILE_NAME not in ("download", "download.zip"):
+        if FILE_NAME and not is_generic_filename(FILE_NAME):
             original_name = FILE_NAME
+        elif is_generic_filename(original_name):
+            if SOURCE_URL:
+                src_parts = [p for p in SOURCE_URL.split("?")[0].split("/") if p and p.lower() != "file"]
+                if src_parts and "." in src_parts[-1]:
+                    original_name = clean_watermarks(urllib.parse.unquote(src_parts[-1]))
+            if is_generic_filename(original_name):
+                original_name = f"{FILE_ID}.zip"
 
         raw_size = os.path.getsize(raw_path)
         report_progress("downloading", 80,
@@ -917,8 +951,10 @@ def main():
         cleaned_name = clean_watermarks(original_name)
         base_name = os.path.splitext(cleaned_name)[0]
         # Strip existing branding if present
-        for strip in [" - lexzytechinc.com", "- lexzytechinc.com", "lexzytechinc.com"]:
+        for strip in [" - lexzytechinc.com", " — lexzytechinc.com", "- lexzytechinc.com", "— lexzytechinc.com", "lexzytechinc.com"]:
             base_name = base_name.replace(strip, "").strip()
+        if is_generic_filename(base_name):
+            base_name = FILE_ID
         branded_name = f"{base_name} - {BRAND_NAME}.zip"
         print(f"  Original name: {original_name}")
         print(f"  Cleaned name:  {cleaned_name}")
