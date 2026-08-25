@@ -29,6 +29,7 @@ import zipfile
 import fnmatch
 import tempfile
 import traceback
+import subprocess
 import urllib.parse
 from pathlib import Path
 from datetime import datetime, timezone
