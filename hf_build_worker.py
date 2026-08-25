@@ -863,25 +863,31 @@ def main():
 
     try:
         # ─── Step 1: Get file metadata ───
-        report_progress("metadata", 2, "Fetching file info...", force=True)
-        try:
-            meta = get_file_metadata(FILE_ID)
-            original_name = meta.get("name", FILE_NAME)
-            file_size = int(meta.get("size", 0))
-            mime_type = meta.get("mimeType", "")
-            print(f"  File: {original_name} ({file_size // (1024*1024)} MB, {mime_type})")
-        except Exception as e:
-            print(f"  Metadata fetch failed (non-fatal): {e}")
-            original_name = FILE_NAME
-            file_size = 0
-            mime_type = ""
+        is_mediafire = (SOURCE_TYPE == "mediafire") or FILE_ID.startswith("mf_") or ("mediafire.com" in SOURCE_URL)
+        original_name = FILE_NAME
 
-        # ─── Step 2: Download from Google Drive ───
+        if not is_mediafire:
+            report_progress("metadata", 2, "Fetching file info...", force=True)
+            try:
+                meta = get_file_metadata(FILE_ID)
+                original_name = meta.get("name", FILE_NAME)
+                file_size = int(meta.get("size", 0))
+                mime_type = meta.get("mimeType", "")
+                print(f"  File: {original_name} ({file_size // (1024*1024)} MB, {mime_type})")
+            except Exception as e:
+                print(f"  Metadata fetch failed (non-fatal): {e}")
+                original_name = FILE_NAME
+
+        # ─── Step 2: Download from Source ───
         report_progress("downloading", 5, "Starting download...", force=True)
 
         if not download_file(FILE_ID, raw_path):
             report_error("All download methods failed. File may be restricted or quota fully exhausted.")
             sys.exit(1)
+
+        # If download resolved a better filename (e.g. MediaFire scraped name), update original_name
+        if FILE_NAME and FILE_NAME not in ("download", "download.zip"):
+            original_name = FILE_NAME
 
         raw_size = os.path.getsize(raw_path)
         report_progress("downloading", 80,
