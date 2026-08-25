@@ -27,6 +27,14 @@ on:
         description: 'Full HF repo ID (e.g., adminlexzytech/phone-firmware)'
         required: false
         default: ''
+      source_type:
+        description: 'Source type (gdrive, mediafire)'
+        required: false
+        default: 'gdrive'
+      source_url:
+        description: 'Original download page URL'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -102,6 +110,8 @@ jobs:
           CALLBACK_URL: ${{ inputs.callback_url }}
           BUILD_ID: ${{ inputs.build_id }}
           EXCLUDE_PATTERNS: ${{ inputs.exclude_patterns }}
+          SOURCE_TYPE: ${{ inputs.source_type }}
+          SOURCE_URL: ${{ inputs.source_url }}
         run: python hf_build_worker.py
 
       - name: Cleanup credentials

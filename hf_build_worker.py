@@ -29,7 +29,7 @@ import zipfile
 import fnmatch
 import tempfile
 import traceback
-import subprocess
+import urllib.parse
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -52,6 +52,8 @@ FILE_NAME           = os.environ.get("FILE_NAME", "")
 CALLBACK_URL        = os.environ.get("CALLBACK_URL", "")
 BUILD_ID            = os.environ.get("BUILD_ID", "")
 EXCLUDE_PATTERNS    = [p.strip() for p in os.environ.get("EXCLUDE_PATTERNS", "").split("\n") if p.strip()]
+SOURCE_TYPE         = os.environ.get("SOURCE_TYPE", "gdrive").strip().lower()
+SOURCE_URL          = os.environ.get("SOURCE_URL", "").strip()
 
 DRIVE_API_BASE   = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3"
@@ -290,12 +292,14 @@ def get_file_metadata(file_id: str) -> dict:
 
 def download_file(file_id: str, dest_path: str) -> bool:
     """
-    Download a file from Google Drive using the same cascade as the PHP engine:
-      1. GAS Bridge copy
-      2. GAS Bridge folder + signed URL
-      3. Web download URL with SA Bearer token
-      4. Standard Drive API download
+    Download a file from storage source (Google Drive or MediaFire).
     """
+    is_mediafire = (SOURCE_TYPE == "mediafire") or file_id.startswith("mf_") or ("mediafire.com" in SOURCE_URL)
+    if is_mediafire:
+        report_progress("downloading", 10, "Connecting to MediaFire source...", force=True)
+        return mediafire_download(file_id, dest_path)
+
+    # ─── Google Drive Cascade ───
     # ─── Approach 1A: GAS Copy ───
     report_progress("downloading", 5, "Trying GAS copy...", force=True)
     if gas_try_copy(file_id, dest_path):
@@ -317,6 +321,103 @@ def download_file(file_id: str, dest_path: str) -> bool:
         return True
 
     return False
+
+
+def mediafire_download(file_id: str, dest_path: str) -> bool:
+    """Download a file from MediaFire by resolving direct link from public page."""
+    global FILE_NAME
+    import re
+
+    quickkey = file_id.replace("mf_", "").strip()
+    page_url = SOURCE_URL if (SOURCE_URL and "mediafire.com" in SOURCE_URL) else f"https://www.mediafire.com/file/{quickkey}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+
+    try:
+        session = requests.Session()
+        resp = session.get(page_url, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            print(f"  MediaFire page returned HTTP {resp.status_code}")
+            return False
+
+        html = resp.text
+
+        # Extract direct download link
+        direct_url = None
+        m = re.search(r'href=["\'](https?://download\d+\.mediafire\.com/[^"\']+)["\']', html, re.I)
+        if m:
+            direct_url = m.group(1)
+        else:
+            m = re.search(r'id=["\']downloadButton["\'][^>]*href=["\']([^"\']+)["\']', html, re.I)
+            if m:
+                direct_url = m.group(1)
+            else:
+                m = re.search(r'aria-label=["\']Download file["\'][^>]*href=["\']([^"\']+)["\']', html, re.I)
+                if m:
+                    direct_url = m.group(1)
+                else:
+                    m = re.search(r'https?://(?:www\.)?mediafire\.com/file_download/[^\s"\'<>]+', html, re.I)
+                    if m:
+                        direct_url = m.group(0)
+
+        if not direct_url:
+            print(f"  Could not extract direct download URL from MediaFire page: {page_url}")
+            return False
+
+        # Extract original filename if not provided or generic
+        if not FILE_NAME or FILE_NAME in ("download", "download.zip"):
+            fn_match = re.search(r'<div[^>]+class=["\'][^"\']*(?:file-name|filename)[^"\']*["\'][^>]*>([^<]+)</div>', html, re.I)
+            if fn_match:
+                extracted_fn = fn_match.group(1).strip()
+                if extracted_fn:
+                    FILE_NAME = clean_watermarks(extracted_fn)
+            else:
+                url_fn = direct_url.split("/")[-1].split("?")[0]
+                if url_fn:
+                    FILE_NAME = clean_watermarks(urllib.parse.unquote(url_fn))
+
+        print(f"  MediaFire direct download link found: {direct_url}")
+        report_progress("downloading", 20, f"Downloading from MediaFire ({FILE_NAME})...")
+
+        dl_resp = session.get(direct_url, headers=headers, stream=True, timeout=60)
+        if dl_resp.status_code != 200:
+            print(f"  MediaFire stream returned HTTP {dl_resp.status_code}")
+            return False
+
+        # Check Content-Disposition for filename
+        cd = dl_resp.headers.get("Content-Disposition", "")
+        if "filename=" in cd and (not FILE_NAME or FILE_NAME in ("download", "download.zip")):
+            cd_fn = re.search(r'filename=["\']?([^"\';]+)', cd)
+            if cd_fn:
+                FILE_NAME = clean_watermarks(cd_fn.group(1).strip())
+
+        total = int(dl_resp.headers.get("Content-Length", 0))
+        downloaded = 0
+
+        with open(dest_path, "wb") as f:
+            for chunk in dl_resp.iter_content(chunk_size=65536):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    pct = int((downloaded / total) * 60) + 20
+                    report_progress("downloading", pct,
+                                    f"Downloaded {downloaded // (1024*1024)} / {total // (1024*1024)} MB")
+
+        if os.path.getsize(dest_path) < 100:
+            print("  MediaFire downloaded file is too small (<100 bytes)")
+            return False
+
+        print(f"  MediaFire download successful: {os.path.getsize(dest_path)} bytes")
+        return True
+
+    except Exception as e:
+        print(f"  MediaFire download exception: {e}")
+        traceback.print_exc()
+        return False
 
 
 def gas_try_copy(file_id: str, dest_path: str) -> bool:
