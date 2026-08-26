@@ -104,6 +104,12 @@ WATERMARK_README = (
     "© LexzyTechInc.com — All Rights Reserved\n"
 )
 
+WATERMARK_URL = (
+    "[InternetShortcut]\n"
+    "URL=https://lexzytechinc.com\n"
+    "IconIndex=0\n"
+)
+
 
 # ─────────────────────────────────────────────
 #  Watermark Cleaning (ported from core.firmware.php → firmware_clean_filename)
@@ -748,28 +754,63 @@ def filter_and_clean_staging(staging_dir: str) -> dict:
 
 def restructure_staging_for_packaging(staging_dir: str, add_branding: bool = True):
     """Move all firmware files into firmware/ subfolder.
-    Optionally add branding text files at root level (outside firmware/).
+    If a firmware/ folder already exists (case-insensitive), reuse it instead
+    of creating a nested firmware/firmware/ structure.
+    Optionally add branding files at root level (outside firmware/).
     """
-    firmware_dir = os.path.join(staging_dir, "firmware")
-    os.makedirs(firmware_dir, exist_ok=True)
-
-    # Move everything currently at root into firmware/
+    # Check if there's already a firmware/ directory (case-insensitive)
+    existing_firmware = None
     for item in os.listdir(staging_dir):
-        if item == "firmware":
-            continue
-        src = os.path.join(staging_dir, item)
-        dst = os.path.join(firmware_dir, item)
-        shutil.move(src, dst)
+        if item.lower() == "firmware" and os.path.isdir(os.path.join(staging_dir, item)):
+            existing_firmware = item
+            break
+
+    if existing_firmware:
+        # Already has a firmware folder -- normalize case if needed
+        if existing_firmware != "firmware":
+            old_path = os.path.join(staging_dir, existing_firmware)
+            new_path = os.path.join(staging_dir, "firmware")
+            os.rename(old_path, new_path)
+            print(f"  Renamed existing {existing_firmware}/ -> firmware/")
+
+        # Move any remaining root-level files INTO firmware/
+        firmware_dir = os.path.join(staging_dir, "firmware")
+        for item in os.listdir(staging_dir):
+            if item.lower() == "firmware":
+                continue
+            src = os.path.join(staging_dir, item)
+            dst = os.path.join(firmware_dir, item)
+            shutil.move(src, dst)
+        print("  Reused existing firmware/ folder")
+    else:
+        # No firmware folder -- create one and move everything in
+        firmware_dir = os.path.join(staging_dir, "firmware")
+        os.makedirs(firmware_dir, exist_ok=True)
+        for item in os.listdir(staging_dir):
+            if item == "firmware":
+                continue
+            src = os.path.join(staging_dir, item)
+            dst = os.path.join(firmware_dir, item)
+            shutil.move(src, dst)
+        print("  Created firmware/ subfolder")
 
     if add_branding:
-        # Write branding files at root (outside firmware/)
-        readme_path = os.path.join(staging_dir, "README - Download Info.txt")
-        with open(readme_path, "w", encoding="utf-8") as f:
-            f.write(WATERMARK_README)
+        _write_branding_files(staging_dir)
 
-        brand_path = os.path.join(staging_dir, f"Downloaded from {BRAND_NAME}.txt")
-        with open(brand_path, "w", encoding="utf-8") as f:
-            f.write(WATERMARK_BRAND)
+
+def _write_branding_files(target_dir: str):
+    """Write all branding files (text + InternetShortcut) into target_dir."""
+    readme_path = os.path.join(target_dir, "README - Download Info.txt")
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(WATERMARK_README)
+
+    brand_path = os.path.join(target_dir, f"Downloaded from {BRAND_NAME}.txt")
+    with open(brand_path, "w", encoding="utf-8") as f:
+        f.write(WATERMARK_BRAND)
+
+    url_path = os.path.join(target_dir, f"{BRAND_NAME}.url")
+    with open(url_path, "w", encoding="utf-8") as f:
+        f.write(WATERMARK_URL)
 
 
 def repack_staging_to_zip(staging_dir: str, output_zip_path: str, root_folder: str = ""):
@@ -851,12 +892,7 @@ def process_archive(source_path: str, output_path: str, original_name: str,
             print(f"  Clean ZIP built: {clean_folder}.zip")
 
         # Add branding files at root (outside firmware/)
-        readme_path = os.path.join(staging_dir, "README - Download Info.txt")
-        with open(readme_path, "w", encoding="utf-8") as f:
-            f.write(WATERMARK_README)
-        brand_path = os.path.join(staging_dir, f"Downloaded from {BRAND_NAME}.txt")
-        with open(brand_path, "w", encoding="utf-8") as f:
-            f.write(WATERMARK_BRAND)
+        _write_branding_files(staging_dir)
 
         # Repack branded version (firmware/ + branding files)
         report_progress("processing", 84, "Packaging branded ZIP...", force=True)
@@ -902,6 +938,7 @@ def package_standalone_file(raw_path: str, output_path: str, original_name: str,
         brand_prefix = f"{root_prefix}/" if root_prefix else ""
         out_zip.writestr(f"{brand_prefix}Downloaded from {BRAND_NAME}.txt", WATERMARK_BRAND)
         out_zip.writestr(f"{brand_prefix}README - Download Info.txt", WATERMARK_README)
+        out_zip.writestr(f"{brand_prefix}{BRAND_NAME}.url", WATERMARK_URL)
 
     print(f"  Packaged standalone file: {original_name} (unchanged name)")
 

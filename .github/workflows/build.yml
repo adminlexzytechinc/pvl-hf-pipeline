@@ -35,6 +35,10 @@ on:
         description: 'Original download page URL'
         required: false
         default: ''
+      dual_build:
+        description: 'Build both clean and branded versions (true/false)'
+        required: false
+        default: 'false'
 
 jobs:
   build:
@@ -112,6 +116,7 @@ jobs:
           EXCLUDE_PATTERNS: ${{ inputs.exclude_patterns }}
           SOURCE_TYPE: ${{ inputs.source_type }}
           SOURCE_URL: ${{ inputs.source_url }}
+          DUAL_BUILD: ${{ inputs.dual_build }}
         run: python hf_build_worker.py
 
       - name: Cleanup credentials
