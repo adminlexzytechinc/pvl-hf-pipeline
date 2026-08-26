@@ -55,6 +55,7 @@ BUILD_ID            = os.environ.get("BUILD_ID", "")
 EXCLUDE_PATTERNS    = [p.strip() for p in os.environ.get("EXCLUDE_PATTERNS", "").split("\n") if p.strip()]
 SOURCE_TYPE         = os.environ.get("SOURCE_TYPE", "gdrive").strip().lower()
 SOURCE_URL          = os.environ.get("SOURCE_URL", "").strip()
+DUAL_BUILD          = os.environ.get("DUAL_BUILD", "false").strip().lower() in ("true", "1", "yes")
 
 DRIVE_API_BASE   = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3"
@@ -247,7 +248,7 @@ def report_error(message: str):
 
 def report_complete(hf_url: str, file_size: int):
     """Report successful completion to WordPress."""
-    print(f"[100%] Complete: {hf_url} ({file_size} bytes)")
+    print(f"[100%] Complete: Upload verified ({file_size} bytes)")
     try:
         requests.post(CALLBACK_URL, json={
             "build_id": BUILD_ID,
@@ -700,12 +701,15 @@ def filter_and_clean_staging(staging_dir: str) -> dict:
     """
     Recursively walk staging_dir bottom-up:
     - Delete excluded files and directories (SP Flash Tool, Drivers, *.url, etc.)
-    - Clean third-party watermarks from all filenames and directory names
+    - Count kept files and total size
+    NOTE: Internal filenames are NEVER renamed. Only the outer ZIP name gets
+    cleaned/branded. This prevents corruption of firmware component names
+    like APDB_MT6761_S01__W2104 and Checksum.ini.
     """
     stats = {"kept": 0, "excluded": 0, "total_size": 0}
 
     for root, dirs, files in os.walk(staging_dir, topdown=False):
-        # 1. Process files
+        # 1. Process files -- delete excluded, count the rest
         for fname in files:
             fpath = os.path.join(root, fname)
             rel_path = os.path.relpath(fpath, staging_dir).replace("\\", "/")
@@ -719,24 +723,13 @@ def filter_and_clean_staging(staging_dir: str) -> dict:
                     pass
                 continue
 
-            # Clean watermark from filename
-            clean_fname = clean_watermarks(fname)
-            if clean_fname and clean_fname != fname:
-                clean_fpath = os.path.join(root, clean_fname)
-                try:
-                    os.rename(fpath, clean_fpath)
-                    fpath = clean_fpath
-                    print(f"  Renamed file: {fname} -> {clean_fname}")
-                except OSError:
-                    pass
-
             stats["kept"] += 1
             try:
                 stats["total_size"] += os.path.getsize(fpath)
             except OSError:
                 pass
 
-        # 2. Process directories
+        # 2. Process directories -- delete excluded
         for dname in dirs:
             dpath = os.path.join(root, dname)
             rel_dpath = os.path.relpath(dpath, staging_dir).replace("\\", "/")
@@ -750,27 +743,48 @@ def filter_and_clean_staging(staging_dir: str) -> dict:
                     pass
                 continue
 
-            # Clean watermark from directory name
-            clean_dname = clean_watermarks(dname)
-            if clean_dname and clean_dname != dname:
-                clean_dpath = os.path.join(root, clean_dname)
-                try:
-                    os.rename(dpath, clean_dpath)
-                    print(f"  Renamed directory: {dname} -> {clean_dname}")
-                except OSError:
-                    pass
-
     return stats
 
 
-def repack_staging_to_zip(staging_dir: str, output_zip_path: str):
-    """Stream all files from staging_dir into a ZIP64 archive without high memory usage."""
+def restructure_staging_for_packaging(staging_dir: str, add_branding: bool = True):
+    """Move all firmware files into firmware/ subfolder.
+    Optionally add branding text files at root level (outside firmware/).
+    """
+    firmware_dir = os.path.join(staging_dir, "firmware")
+    os.makedirs(firmware_dir, exist_ok=True)
+
+    # Move everything currently at root into firmware/
+    for item in os.listdir(staging_dir):
+        if item == "firmware":
+            continue
+        src = os.path.join(staging_dir, item)
+        dst = os.path.join(firmware_dir, item)
+        shutil.move(src, dst)
+
+    if add_branding:
+        # Write branding files at root (outside firmware/)
+        readme_path = os.path.join(staging_dir, "README - Download Info.txt")
+        with open(readme_path, "w", encoding="utf-8") as f:
+            f.write(WATERMARK_README)
+
+        brand_path = os.path.join(staging_dir, f"Downloaded from {BRAND_NAME}.txt")
+        with open(brand_path, "w", encoding="utf-8") as f:
+            f.write(WATERMARK_BRAND)
+
+
+def repack_staging_to_zip(staging_dir: str, output_zip_path: str, root_folder: str = ""):
+    """Stream all files from staging_dir into a ZIP64 archive without high memory usage.
+    If root_folder is set, all ZIP entry paths are prefixed with it to create
+    a single top-level folder inside the ZIP.
+    """
     CHUNK_SIZE = 64 * 1024 * 1024  # 64MB streaming buffer
     with zipfile.ZipFile(output_zip_path, "w", zipfile.ZIP_STORED, allowZip64=True) as out_zip:
         for root, _, files in os.walk(staging_dir):
             for fname in files:
                 fpath = os.path.join(root, fname)
                 rel_path = os.path.relpath(fpath, staging_dir).replace("\\", "/")
+                if root_folder:
+                    rel_path = f"{root_folder}/{rel_path}"
                 with open(fpath, "rb") as src, \
                      out_zip.open(rel_path, "w", force_zip64=True) as dst:
                     while True:
@@ -780,11 +794,21 @@ def repack_staging_to_zip(staging_dir: str, output_zip_path: str):
                         dst.write(chunk)
 
 
-def process_archive(source_path: str, output_path: str, original_name: str) -> dict:
+def process_archive(source_path: str, output_path: str, original_name: str,
+                    root_folder: str = "", clean_output_path: str = "") -> dict:
     """
     Extract archive (.rar, .7z, .zip, .tar), filter exclusions,
-    clean watermarks on all internal filenames/paths, add brand text files,
-    and repack into a single clean ZIP archive.
+    restructure into firmware/ subfolder, add brand text files,
+    and repack into a clean ZIP archive.
+
+    Internal filenames are NEVER modified -- only excluded files are removed.
+
+    Args:
+        source_path: Path to the downloaded archive
+        output_path: Destination for the branded ZIP
+        original_name: Original filename (for extraction fallback)
+        root_folder: Top-level folder name inside the branded ZIP
+        clean_output_path: If set, also build a clean (unbranded) ZIP here
     """
     report_progress("processing", 81, "Extracting archive contents...", force=True)
     staging_dir = tempfile.mkdtemp(prefix="pvl_stage_")
@@ -812,22 +836,31 @@ def process_archive(source_path: str, output_path: str, original_name: str) -> d
         # Flatten staging directory if there's a single top-level folder
         flatten_staging_dir(staging_dir)
 
-        # Walk through staging dir: remove exclusions and clean watermarks
-        report_progress("processing", 83, "Cleaning files and removing exclusions...", force=True)
+        # Remove excluded files only -- NO renaming of internal filenames
+        report_progress("processing", 83, "Removing exclusions...", force=True)
         stats = filter_and_clean_staging(staging_dir)
 
-        # Add watermark text files at root
+        # Move all files into firmware/ subfolder (no branding yet)
+        restructure_staging_for_packaging(staging_dir, add_branding=False)
+
+        # If dual-build is on, repack the clean version FIRST (firmware/ only)
+        if clean_output_path:
+            report_progress("processing", 84, "Packaging clean ZIP...", force=True)
+            clean_folder = root_folder.replace(f" - {BRAND_NAME}", "")
+            repack_staging_to_zip(staging_dir, clean_output_path, root_folder=clean_folder)
+            print(f"  Clean ZIP built: {clean_folder}.zip")
+
+        # Add branding files at root (outside firmware/)
         readme_path = os.path.join(staging_dir, "README - Download Info.txt")
         with open(readme_path, "w", encoding="utf-8") as f:
             f.write(WATERMARK_README)
-
         brand_path = os.path.join(staging_dir, f"Downloaded from {BRAND_NAME}.txt")
         with open(brand_path, "w", encoding="utf-8") as f:
             f.write(WATERMARK_BRAND)
 
-        # Repack staging dir into output_path (.zip) with ZIP64 & ZIP_STORED
-        report_progress("processing", 84, "Packaging clean ZIP...", force=True)
-        repack_staging_to_zip(staging_dir, output_path)
+        # Repack branded version (firmware/ + branding files)
+        report_progress("processing", 84, "Packaging branded ZIP...", force=True)
+        repack_staging_to_zip(staging_dir, output_path, root_folder=root_folder)
 
         print(f"  Processed archive: {stats['kept']} files kept, {stats['excluded']} excluded, "
               f"{stats['total_size'] // (1024*1024)} MB")
@@ -837,29 +870,40 @@ def process_archive(source_path: str, output_path: str, original_name: str) -> d
         shutil.rmtree(staging_dir, ignore_errors=True)
 
 
-def package_standalone_file(raw_path: str, output_path: str, original_name: str):
+def package_standalone_file(raw_path: str, output_path: str, original_name: str,
+                           root_folder: str = ""):
     """
     For disk images (.iso) and standalone binaries (.pac, .img, .bin):
-    Place the intact file into the container ZIP under its clean unwatermarked name,
-    along with the download branding text files.
+    Place the intact file into firmware/ subfolder under its EXACT original name,
+    along with the download branding text files at the root level.
+
+    Structure: {root_folder}/firmware/{original_name}
+               {root_folder}/README - Download Info.txt
+               {root_folder}/Downloaded from lexzytechinc.com.txt
     """
     report_progress("processing", 82, "Packaging standalone file...", force=True)
-    cleaned_inner_name = clean_watermarks(original_name)
-    if not cleaned_inner_name:
-        cleaned_inner_name = original_name
 
     CHUNK_SIZE = 64 * 1024 * 1024
+    firmware_prefix = f"{root_folder}/firmware" if root_folder else "firmware"
+    root_prefix = root_folder if root_folder else ""
+
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_STORED, allowZip64=True) as out_zip:
+        # Write the firmware file into firmware/ subfolder with its original name
+        inner_path = f"{firmware_prefix}/{original_name}"
         with open(raw_path, "rb") as src, \
-             out_zip.open(cleaned_inner_name, "w", force_zip64=True) as dst:
+             out_zip.open(inner_path, "w", force_zip64=True) as dst:
             while True:
                 chunk = src.read(CHUNK_SIZE)
                 if not chunk:
                     break
                 dst.write(chunk)
-        out_zip.writestr(f"Downloaded from {BRAND_NAME}.txt", WATERMARK_BRAND)
-        out_zip.writestr(f"README - Download Info.txt", WATERMARK_README)
-    print(f"  Packaged standalone file: {original_name} -> {cleaned_inner_name}")
+
+        # Write branding files at root level (outside firmware/)
+        brand_prefix = f"{root_prefix}/" if root_prefix else ""
+        out_zip.writestr(f"{brand_prefix}Downloaded from {BRAND_NAME}.txt", WATERMARK_BRAND)
+        out_zip.writestr(f"{brand_prefix}README - Download Info.txt", WATERMARK_README)
+
+    print(f"  Packaged standalone file: {original_name} (unchanged name)")
 
 
 # ─────────────────────────────────────────────
@@ -883,7 +927,7 @@ def upload_to_hf(file_path: str, hf_filename: str) -> str:
 
     # Construct the direct download URL
     hf_url = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{hf_filename}"
-    print(f"  Uploaded to HF: {hf_url}")
+    print(f"  Uploaded to HF: [masked] ({FILE_ID})")
     return hf_url
 
 
@@ -899,11 +943,13 @@ def main():
     print(f"  Build ID:  {BUILD_ID}")
     print(f"  Excludes:  {EXCLUDE_PATTERNS}")
     print(f"  HF Repo:   {HF_REPO_ID}")
+    print(f"  Dual Build: {DUAL_BUILD}")
     print("=" * 60)
 
     work_dir = tempfile.mkdtemp(prefix="pvl_build_")
     raw_path = os.path.join(work_dir, "raw_download")
     processed_path = os.path.join(work_dir, "processed.zip")
+    clean_path = os.path.join(work_dir, "clean.zip") if DUAL_BUILD else ""
 
     try:
         # ─── Step 1: Get file metadata ───
@@ -945,26 +991,8 @@ def main():
         report_progress("downloading", 80,
                         f"Download complete ({raw_size // (1024*1024)} MB)", force=True)
 
-        # ─── Step 3: Process the File ───
-        if is_extractable_archive(raw_path, original_name):
-            stats = process_archive(raw_path, processed_path, original_name)
-        else:
-            package_standalone_file(raw_path, processed_path, original_name)
-
-        processed_size = os.path.getsize(processed_path)
-        report_progress("processing", 85,
-                        f"Processing complete ({processed_size // (1024*1024)} MB)", force=True)
-
-        # Sanity check: a ZIP with only watermarks and no real content is ~3-4KB.
-        # Any real firmware file produces at least several MB. If we got less than
-        # 10KB, the download was garbage and we'd be poisoning the cache.
-        if processed_size < 10240:
-            report_error(f"Processed ZIP is only {processed_size} bytes — source download was likely corrupt or empty. Aborting.")
-            sys.exit(1)
-
-        # ─── Step 4: Build the HF filename ───
-        # Format: {fileId}/branded_name.zip
-        # First strip third-party site watermarks from the source filename
+        # ─── Step 3: Compute branded name BEFORE processing ───
+        # clean_watermarks() is ONLY applied to the outer archive name, never internal files
         cleaned_name = clean_watermarks(original_name)
         base_name = os.path.splitext(cleaned_name)[0]
         # Strip existing branding if present
@@ -973,22 +1001,49 @@ def main():
         if is_generic_filename(base_name):
             base_name = FILE_ID
         branded_name = f"{base_name} - {BRAND_NAME}.zip"
+        root_folder = os.path.splitext(branded_name)[0]  # folder name = zip name minus .zip
         print(f"  Original name: {original_name}")
         print(f"  Cleaned name:  {cleaned_name}")
         print(f"  Branded name:  {branded_name}")
-        # HF filename uses fileId prefix for uniqueness
-        hf_filename = f"{FILE_ID}/{branded_name}"
+
+        # ─── Step 4: Process the File ───
+        if is_extractable_archive(raw_path, original_name):
+            stats = process_archive(raw_path, processed_path, original_name,
+                                    root_folder=root_folder,
+                                    clean_output_path=clean_path if DUAL_BUILD else "")
+        else:
+            package_standalone_file(raw_path, processed_path, original_name,
+                                   root_folder=root_folder)
+
+        processed_size = os.path.getsize(processed_path)
+        report_progress("processing", 85,
+                        f"Processing complete ({processed_size // (1024*1024)} MB)", force=True)
+
+        # Sanity check: a ZIP with only watermarks and no real content is ~3-4KB.
+        if processed_size < 10240:
+            report_error(f"Processed ZIP is only {processed_size} bytes -- source download was likely corrupt or empty. Aborting.")
+            sys.exit(1)
 
         # ─── Step 5: Upload to Hugging Face ───
+        hf_filename = f"{FILE_ID}/{branded_name}"
         hf_url = upload_to_hf(processed_path, hf_filename)
+
+        # If dual build, upload the clean version too
+        hf_url_clean = ""
+        if DUAL_BUILD and clean_path and os.path.exists(clean_path):
+            clean_hf_name = f"{FILE_ID}/{base_name}.zip"
+            hf_url_clean = upload_to_hf(clean_path, clean_hf_name)
+            print(f"  Clean version uploaded ({FILE_ID})")
 
         # ─── Step 6: Report completion ───
         report_complete(hf_url, processed_size)
 
         print("\n" + "=" * 60)
         print("BUILD SUCCESSFUL")
-        print(f"  HF URL: {hf_url}")
+        print(f"  HF URL: [masked]")
         print(f"  Size:   {processed_size // (1024*1024)} MB")
+        if DUAL_BUILD and hf_url_clean:
+            print(f"  Clean:  [masked]")
         print("=" * 60)
 
     except SystemExit:
