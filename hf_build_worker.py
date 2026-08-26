@@ -975,11 +975,12 @@ def upload_to_hf(file_path: str, hf_filename: str) -> str:
 def main():
     print("=" * 60)
     print(f"PVL Build Worker")
-    print(f"  File ID:   {FILE_ID}")
-    print(f"  Filename:  {FILE_NAME}")
-    print(f"  Build ID:  {BUILD_ID}")
-    print(f"  Excludes:  {EXCLUDE_PATTERNS}")
-    print(f"  HF Repo:   {HF_REPO_ID}")
+    print(f"  File ID:    {FILE_ID}")
+    print(f"  Filename:   {FILE_NAME}")
+    print(f"  Build ID:   {BUILD_ID}")
+    print(f"  Excludes:   {len(EXCLUDE_PATTERNS)} patterns")
+    print(f"  HF Repo:    [configured]")
+    print(f"  Callback:   [configured]")
     print(f"  Dual Build: {DUAL_BUILD}")
     print("=" * 60)
 
