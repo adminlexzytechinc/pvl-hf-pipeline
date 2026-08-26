@@ -154,8 +154,8 @@ def clean_watermarks(filename: str) -> str:
     # 2. _[HardReset.info] or similar anywhere
     c = _re.sub(r'_?\[[^\]]+\]', '', c)
 
-    # 3. Leading site domain prefix: "up_addROM.com_", "www.site.com-", etc.
-    c = _re.sub(r'^(?:up_)?(?:www\.)?[a-zA-Z0-9_-]+\.(?:com|net|org|co|in|info|io|xyz|biz)[_\s-]*', '', c, flags=_re.I)
+    # 3. Leading site domain prefix: "up_addROM.com_", "www.site.com-", "site.com_", etc.
+    c = _re.sub(r'^(?:up_)?(?:www\.)?[a-zA-Z0-9]+\.(?:com|net|org|co|in|info|io|xyz|biz)[_\s-]+', '', c, flags=_re.I)
 
     # 4. _by_(FirmwareOS.com) -- specific pattern BEFORE general parens removal
     c = _re.sub(r'_?by_?\(?[a-zA-Z0-9_-]+(?:\.[a-zA-Z]{2,6})?\)?', '', c, flags=_re.I)
