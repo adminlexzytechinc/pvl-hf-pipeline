@@ -111,17 +111,33 @@ WATERMARK_README = (
 import re as _re
 
 def is_generic_filename(name: str) -> bool:
-    """Check if a filename is a generic placeholder (like 'file', 'download', etc.)."""
+    """Check if a filename is a generic placeholder, file ID, or hash."""
     if not name:
         return True
-    clean = name.strip().lower()
-    # Check exact generic words
-    if clean in ("download", "download.zip", "file", "file.zip", "raw_download", "raw_download.zip", "archive", "document", "none", "null"):
+    clean = str(name).strip()
+    clean_lower = clean.lower()
+
+    # 1. Check exact generic words
+    if clean_lower in ("download", "download.zip", "file", "file.zip", "raw_download", "raw_download.zip", "archive", "document", "none", "null"):
         return True
-    # Strip extension and check base name
-    base = os.path.splitext(clean)[0]
+
+    # 2. Check if name matches FILE_ID or is an ID prefix
+    if FILE_ID and (clean == FILE_ID or clean_lower == FILE_ID.lower() or clean_lower == f"{FILE_ID.lower()}.zip"):
+        return True
+    if clean_lower.startswith("mf_") or clean_lower.startswith("pvl_"):
+        return True
+
+    # 3. Strip extension and check base name
+    base = os.path.splitext(clean_lower)[0]
     if base in ("download", "file", "raw_download", "archive", "document", "none", "null"):
         return True
+    if FILE_ID and base == FILE_ID.lower():
+        return True
+
+    # 4. If base has no dots, no spaces, and looks like a raw Google Drive ID or hash (25-50 chars)
+    if "." not in clean and _re.match(r'^[a-zA-Z0-9_-]{25,50}$', clean):
+        return True
+
     return False
 
 def clean_watermarks(filename: str) -> str:
@@ -898,13 +914,14 @@ def main():
             report_progress("metadata", 2, "Fetching file info...", force=True)
             try:
                 meta = get_file_metadata(FILE_ID)
-                original_name = meta.get("name", FILE_NAME)
+                meta_name = meta.get("name", "")
+                if meta_name and not is_generic_filename(meta_name):
+                    original_name = meta_name
                 file_size = int(meta.get("size", 0))
                 mime_type = meta.get("mimeType", "")
                 print(f"  File: {original_name} ({file_size // (1024*1024)} MB, {mime_type})")
             except Exception as e:
                 print(f"  Metadata fetch failed (non-fatal): {e}")
-                original_name = FILE_NAME
 
         # ─── Step 2: Download from Source ───
         report_progress("downloading", 5, "Starting download...", force=True)
@@ -913,13 +930,13 @@ def main():
             report_error("All download methods failed. File may be restricted or quota fully exhausted.")
             sys.exit(1)
 
-        # If download resolved a better filename (e.g. MediaFire scraped name), update original_name
-        if FILE_NAME and not is_generic_filename(FILE_NAME):
-            original_name = FILE_NAME
-        elif is_generic_filename(original_name):
-            if SOURCE_URL:
-                src_parts = [p for p in SOURCE_URL.split("?")[0].split("/") if p and p.lower() != "file"]
-                if src_parts and "." in src_parts[-1]:
+        # Update original_name ONLY if it is currently generic or an ID
+        if is_generic_filename(original_name):
+            if FILE_NAME and not is_generic_filename(FILE_NAME):
+                original_name = FILE_NAME
+            elif SOURCE_URL:
+                src_parts = [p for p in SOURCE_URL.split("?")[0].split("/") if p and p.lower() not in ("file", "view", "edit", "download")]
+                if src_parts and "." in src_parts[-1] and not is_generic_filename(src_parts[-1]):
                     original_name = clean_watermarks(urllib.parse.unquote(src_parts[-1]))
             if is_generic_filename(original_name):
                 original_name = f"{FILE_ID}.zip"
