@@ -124,26 +124,53 @@ def is_generic_filename(name: str) -> bool:
     clean = str(name).strip()
     clean_lower = clean.lower()
 
-    # 1. Check exact generic words
-    if clean_lower in ("download", "download.zip", "file", "file.zip", "raw_download", "raw_download.zip", "archive", "document", "none", "null"):
+    # 1. Exact generic words
+    generic_words = (
+        "download", "download.zip", "download.rar", "download.7z",
+        "file", "file.zip", "file.rar", "file.7z",
+        "raw_download", "raw_download.zip",
+        "archive", "archive.zip",
+        "document", "document.zip",
+        "none", "null", "undefined",
+        "get", "get.zip", "link", "link.zip"
+    )
+    if clean_lower in generic_words:
         return True
 
-    # 2. Check if name matches FILE_ID or is an ID prefix
-    if FILE_ID and (clean == FILE_ID or clean_lower == FILE_ID.lower() or clean_lower == f"{FILE_ID.lower()}.zip"):
-        return True
-    if clean_lower.startswith("mf_") or clean_lower.startswith("pvl_"):
-        return True
-
-    # 3. Strip extension and check base name
-    base = os.path.splitext(clean_lower)[0]
-    if base in ("download", "file", "raw_download", "archive", "document", "none", "null"):
-        return True
-    if FILE_ID and base == FILE_ID.lower():
+    # 2. Check base name without extension
+    base = os.path.splitext(clean)[0]
+    base_lower = base.lower()
+    if base_lower in generic_words:
         return True
 
-    # 4. If base has no dots, no spaces, and looks like a raw Google Drive ID or hash (25-50 chars)
-    if "." not in clean and _re.match(r'^[a-zA-Z0-9_-]{25,50}$', clean):
+    # 3. Exact match with FILE_ID
+    if FILE_ID:
+        if clean == FILE_ID or clean_lower == FILE_ID.lower():
+            return True
+        if base == FILE_ID or base_lower == FILE_ID.lower():
+            return True
+        # If FILE_ID is mf_xxx, check raw xxx
+        if FILE_ID.startswith("mf_"):
+            raw_mf_id = FILE_ID[3:].lower()
+            if base_lower == raw_mf_id or clean_lower == raw_mf_id:
+                return True
+
+    # 4. Check if it's purely an ID prefix like pvl_... or mf_ followed only by ID chars
+    if _re.match(r'^(?:mf_|pvl_)[a-zA-Z0-9_-]{8,60}$', base, _re.I):
         return True
+
+    # 5. Raw Google Drive ID / hash pattern (25-45 random alphanumeric chars, but NOT containing firmware separators/words)
+    if "." not in clean:
+        # If it has underscores, spaces, or hyphens separating words, it is a real firmware name
+        if "_" in clean or " " in clean:
+            return False
+        # If it contains common firmware indicators, it's not a hash
+        fw_indicators = ('mt6', 'mt8', 'qualcomm', 'snapdragon', 'exynos', 'unisoc', 'spd', 'firmware', 'flash', 'stock', 'rom', 'scatter', 'ota', 'build', 'global')
+        if any(ind in clean_lower for ind in fw_indicators):
+            return False
+        # Pure random alphanumeric 25-50 chars with no spaces or underscores
+        if _re.match(r'^[a-zA-Z0-9]{25,50}$', clean):
+            return True
 
     return False
 
@@ -408,23 +435,35 @@ def mediafire_download(file_id: str, dest_path: str) -> bool:
 
         # Extract original filename from MediaFire HTML, direct URL, or SOURCE_URL
         scraped_fn = None
-        fn_match = re.search(r'<div[^>]+class=["\'][^"\']*(?:file-name|filename)[^"\']*["\'][^>]*>([^<]+)</div>', html, re.I)
-        if fn_match:
-            scraped_fn = fn_match.group(1).strip()
+        fn_patterns = [
+            r'<div[^>]+class=["\'][^"\']*(?:file-name|filename|filename-text)[^"\']*["\'][^>]*>([^<]+)</div>',
+            r'class=["\']filename["\'][^>]*>([^<]+)<',
+            r'<meta property=["\']og:title["\'] content=["\']([^"\']+)["\']',
+            r'<title>([^<]+)</title>',
+        ]
+        for pat in fn_patterns:
+            fn_m = re.search(pat, html, re.I)
+            if fn_m:
+                cand = fn_m.group(1).strip()
+                # Strip trailing " - MediaFire" if from title
+                cand = re.sub(r'\s*-\s*MediaFire\s*$', '', cand, flags=re.I).strip()
+                if cand and not is_generic_filename(cand):
+                    scraped_fn = cand
+                    break
         
         if not scraped_fn and direct_url:
             url_fn = direct_url.split("/")[-1].split("?")[0]
-            if url_fn:
+            if url_fn and not is_generic_filename(url_fn):
                 scraped_fn = urllib.parse.unquote(url_fn)
 
         if not scraped_fn and SOURCE_URL:
-            src_parts = [p for p in SOURCE_URL.split("?")[0].split("/") if p and p.lower() != "file"]
-            if src_parts and "." in src_parts[-1]:
+            src_parts = [p for p in SOURCE_URL.split("?")[0].split("/") if p and p.lower() not in ("file", "view", "download", "edit")]
+            if src_parts and not is_generic_filename(src_parts[-1]):
                 scraped_fn = urllib.parse.unquote(src_parts[-1])
 
         if scraped_fn:
             scraped_clean = clean_watermarks(scraped_fn)
-            if is_generic_filename(FILE_NAME) or ("." in scraped_clean and "." not in FILE_NAME):
+            if is_generic_filename(FILE_NAME) or ("." in scraped_clean and "." not in FILE_NAME) or FILE_NAME.startswith("mf_"):
                 FILE_NAME = scraped_clean
                 print(f"  Scraped MediaFire filename: {FILE_NAME}")
 
@@ -442,7 +481,7 @@ def mediafire_download(file_id: str, dest_path: str) -> bool:
             cd_fn = re.search(r'filename=["\']?([^"\';]+)', cd)
             if cd_fn:
                 cd_name = clean_watermarks(cd_fn.group(1).strip())
-                if is_generic_filename(FILE_NAME) or ("." in cd_name and "." not in FILE_NAME):
+                if is_generic_filename(FILE_NAME) or ("." in cd_name and "." not in FILE_NAME) or FILE_NAME.startswith("mf_"):
                     FILE_NAME = cd_name
                     print(f"  Content-Disposition filename: {FILE_NAME}")
 
