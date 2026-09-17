@@ -55,7 +55,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install system archive utilities
-        run: sudo apt-get update && sudo apt-get install -y p7zip-full unrar
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full unrar megatools
 
       - name: Install dependencies
         run: |
@@ -107,6 +107,8 @@ jobs:
           GAS_BRIDGE_URL: ${{ secrets.GAS_BRIDGE_URL }}
           GAS_BRIDGE_SECRET: ${{ secrets.GAS_BRIDGE_SECRET }}
           BUILD_CALLBACK_SECRET: ${{ secrets.BUILD_CALLBACK_SECRET }}
+          MEGA_USER: ${{ secrets.MEGA_USER }}
+          MEGA_PASS: ${{ secrets.MEGA_PASS }}
           HF_REPO_ID: ${{ steps.get-repo.outputs.repo_id }}
           HF_TOKEN: ${{ steps.get-token.outputs.token }}
           FILE_ID: ${{ inputs.file_id }}

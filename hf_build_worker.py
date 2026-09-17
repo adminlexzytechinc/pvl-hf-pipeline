@@ -38,6 +38,9 @@ import jwt       # PyJWT
 import requests
 from huggingface_hub import HfApi
 
+from mega_url import is_mega_url
+from mega_download import mega_download
+
 # ─────────────────────────────────────────────
 #  Configuration
 # ─────────────────────────────────────────────
@@ -435,9 +438,34 @@ def verify_archive_integrity(filepath: str, original_name: str = "") -> tuple[bo
 
 def download_file(file_id: str, dest_path: str) -> bool:
     """
-    Download a file from storage source (Google Drive or MediaFire).
+    Download a file from storage source (MEGA, MediaFire, or Google Drive).
     Validates archive integrity after download; if corrupted, unlinks and tries next method.
     """
+    global FILE_NAME
+
+    # ─── MEGA Source ───
+    is_mega = (SOURCE_TYPE == "mega") or file_id.startswith("mega_") or is_mega_url(SOURCE_URL or "")
+    if is_mega:
+        report_progress("downloading", 10, "Connecting to MEGA source...", force=True)
+        ok, real_name = mega_download(file_id, SOURCE_URL or "", dest_path)
+        if not ok:
+            return False
+        if real_name and not is_generic_filename(real_name):
+            FILE_NAME = real_name
+        if os.path.exists(dest_path):
+            ok, reason = verify_archive_integrity(dest_path, FILE_NAME)
+            if not ok:
+                print(f"  MEGA download failed integrity check: {reason}")
+                try:
+                    os.unlink(dest_path)
+                except Exception:
+                    pass
+                return False
+            print(f"  MEGA download verified intact: {reason}")
+            return True
+        return False
+
+    # ─── MediaFire Source ───
     is_mediafire = (SOURCE_TYPE == "mediafire") or file_id.startswith("mf_") or ("mediafire.com" in (SOURCE_URL or ""))
     if is_mediafire:
         report_progress("downloading", 10, "Connecting to MediaFire source...", force=True)
@@ -1173,10 +1201,11 @@ def main():
 
     try:
         # ─── Step 1: Get file metadata ───
-        is_mediafire = (SOURCE_TYPE == "mediafire") or FILE_ID.startswith("mf_") or ("mediafire.com" in SOURCE_URL)
+        is_mediafire = (SOURCE_TYPE == "mediafire") or FILE_ID.startswith("mf_") or ("mediafire.com" in (SOURCE_URL or ""))
+        is_mega = (SOURCE_TYPE == "mega") or FILE_ID.startswith("mega_") or is_mega_url(SOURCE_URL or "")
         original_name = FILE_NAME
 
-        if not is_mediafire:
+        if not is_mediafire and not is_mega:
             report_progress("metadata", 2, "Fetching file info...", force=True)
             try:
                 meta = get_file_metadata(FILE_ID)
