@@ -135,7 +135,9 @@ def is_generic_filename(name: str) -> bool:
         "archive", "archive.zip",
         "document", "document.zip",
         "none", "null", "undefined",
-        "get", "get.zip", "link", "link.zip"
+        "get", "get.zip", "link", "link.zip",
+        "mega", "mega.zip", "mega.nz", "mega.io", "maga", "maga.zip",
+        "mediafire", "mediafire.com", "gdrive", "drive"
     )
     if clean_lower in generic_words:
         return True
@@ -144,6 +146,10 @@ def is_generic_filename(name: str) -> bool:
     base = os.path.splitext(clean)[0]
     base_lower = base.lower()
     if base_lower in generic_words:
+        return True
+
+    # Check if name is purely a domain name (e.g. mega.nz, mediafire.com)
+    if _re.match(r'^[a-zA-Z0-9-]+\.(?:com|net|org|nz|io|co|in|xyz|biz|info)$', clean, _re.I):
         return True
 
     # 3. Exact match with FILE_ID
@@ -157,9 +163,14 @@ def is_generic_filename(name: str) -> bool:
             raw_mf_id = FILE_ID[3:].lower()
             if base_lower == raw_mf_id or clean_lower == raw_mf_id:
                 return True
+        # If FILE_ID is mega_xxx, check raw xxx
+        if FILE_ID.startswith("mega_"):
+            raw_mega_id = FILE_ID[5:].lower()
+            if base_lower == raw_mega_id or clean_lower == raw_mega_id:
+                return True
 
-    # 4. Check if it's purely an ID prefix like pvl_... or mf_ followed only by ID chars
-    if _re.match(r'^(?:mf_|pvl_)[a-zA-Z0-9_-]{8,60}$', base, _re.I):
+    # 4. Check if it's purely an ID prefix like pvl_... or mf_ or mega_ followed only by ID chars
+    if _re.match(r'^(?:mf_|pvl_|mega_)[a-zA-Z0-9_-]{6,60}$', base, _re.I):
         return True
 
     # 5. Raw Google Drive ID / hash pattern (25-45 random alphanumeric chars, but NOT containing firmware separators/words)
@@ -1225,7 +1236,12 @@ def main():
             report_error("All download methods failed. File may be restricted or quota fully exhausted.")
             sys.exit(1)
 
-        # Update original_name ONLY if it is currently generic or an ID
+        # Update original_name: if download recovered a non-generic filename (e.g. from MEGA or MediaFire Content-Disposition), adopt it!
+        if FILE_NAME and not is_generic_filename(FILE_NAME):
+            if is_generic_filename(original_name) or is_mega or is_mediafire:
+                original_name = FILE_NAME
+
+        # Fallback to URL path or FILE_ID if still generic
         if is_generic_filename(original_name):
             if FILE_NAME and not is_generic_filename(FILE_NAME):
                 original_name = FILE_NAME
