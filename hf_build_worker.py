@@ -279,11 +279,19 @@ def report_error(message: str):
         pass
 
 
-def report_complete(hf_url: str, file_size: int):
-    """Report successful completion to WordPress."""
+def report_complete(hf_url: str, file_size: int, hf_url_clean: str = "", file_size_clean: int = 0):
+    """Report successful completion to WordPress.
+
+    hf_url_clean / file_size_clean are only sent when a DUAL_BUILD run
+    actually produced an unwatermarked variant -- they're additive fields
+    on the same payload, so a non-dual-build run (or a WordPress side that
+    hasn't been updated to read them yet) is unaffected.
+    """
     print(f"[100%] Complete: Upload verified ({file_size} bytes)")
+    if hf_url_clean:
+        print(f"[100%] Clean variant verified ({file_size_clean} bytes)")
     try:
-        requests.post(CALLBACK_URL, json={
+        payload = {
             "build_id": BUILD_ID,
             "file_id":  FILE_ID,
             "secret":   CALLBACK_SECRET,
@@ -292,7 +300,11 @@ def report_complete(hf_url: str, file_size: int):
             "message":  "Build complete",
             "hf_url":   hf_url,
             "hf_size":  file_size,
-        }, timeout=10)
+        }
+        if hf_url_clean:
+            payload["hf_url_clean"]  = hf_url_clean
+            payload["hf_size_clean"] = file_size_clean
+        requests.post(CALLBACK_URL, json=payload, timeout=10)
     except Exception:
         pass
 
@@ -352,38 +364,130 @@ def get_file_metadata(file_id: str) -> dict:
 
 
 # ─────────────────────────────────────────────
+#  Archive & Download Integrity Verification
+# ─────────────────────────────────────────────
+
+EXTRACTABLE_EXTENSIONS = {'.zip', '.rar', '.7z', '.tar', '.gz', '.tgz', '.bz2', '.xz'}
+STANDALONE_EXTENSIONS  = {'.iso', '.img', '.pac', '.bin', '.exe', '.tar.md5'}
+
+
+def verify_archive_integrity(filepath: str, original_name: str = "") -> tuple[bool, str]:
+    """
+    Test whether a downloaded archive is intact or corrupted.
+    Returns (True, "OK") or (False, error_reason).
+    """
+    if not os.path.exists(filepath):
+        return False, "File does not exist"
+
+    size = os.path.getsize(filepath)
+    if size < 1024:
+        return False, f"File suspiciously small ({size} bytes)"
+
+    name = original_name or os.path.basename(filepath)
+    ext = os.path.splitext(name)[1].lower()
+
+    # Standalone files (.pac, .bin, .img, .iso, etc.) are flashed directly and not archives
+    if ext in STANDALONE_EXTENSIONS:
+        return True, "Standalone file (non-archive)"
+
+    # Magic byte signature check
+    try:
+        with open(filepath, "rb") as f:
+            header = f.read(16)
+        if ext == ".zip" and not (header.startswith(b"PK\x03\x04") or header.startswith(b"PK\x05\x06") or header.startswith(b"PK\x07\x08")):
+            return False, f"Invalid ZIP magic bytes: {header[:8]!r}"
+        if ext == ".rar" and not header.startswith(b"Rar!\x1a\x07"):
+            return False, f"Invalid RAR magic bytes: {header[:8]!r}"
+        if ext == ".7z" and not header.startswith(b"7z\xbc\xaf\x27\x1c"):
+            return False, f"Invalid 7Z magic bytes: {header[:8]!r}"
+    except Exception as e:
+        return False, f"Header read error: {e}"
+
+    # Primary integrity test: run 7z t (tests CRC32 of all internal streams in memory)
+    try:
+        res = subprocess.run(["7z", "t", "-y", filepath],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode == 0:
+            return True, "7z integrity test passed"
+        else:
+            err_output = res.stderr.decode("utf-8", errors="replace").strip() or res.stdout.decode("utf-8", errors="replace").strip()
+            err_lines = [line.strip() for line in err_output.splitlines() if line.strip()]
+            reason = " | ".join(err_lines[-3:]) if err_lines else f"7z exit code {res.returncode}"
+            return False, f"7z test failed: {reason}"
+    except FileNotFoundError:
+        # Fallback to python zipfile.testzip() if 7z binary is absent
+        if ext == ".zip" or zipfile.is_zipfile(filepath):
+            try:
+                with zipfile.ZipFile(filepath, "r") as zf:
+                    corrupt_member = zf.testzip()
+                    if corrupt_member is not None:
+                        return False, f"ZIP CRC failed on member: {corrupt_member}"
+                    return True, "zipfile testzip passed"
+            except Exception as e:
+                return False, f"zipfile test failed: {e}"
+
+    return True, "Integrity assumed (no testing tool available)"
+
+
+# ─────────────────────────────────────────────
 #  Download Cascade (mirrors PHP pvl_sa_download_to_temp)
 # ─────────────────────────────────────────────
 
 def download_file(file_id: str, dest_path: str) -> bool:
     """
     Download a file from storage source (Google Drive or MediaFire).
+    Validates archive integrity after download; if corrupted, unlinks and tries next method.
     """
-    is_mediafire = (SOURCE_TYPE == "mediafire") or file_id.startswith("mf_") or ("mediafire.com" in SOURCE_URL)
+    is_mediafire = (SOURCE_TYPE == "mediafire") or file_id.startswith("mf_") or ("mediafire.com" in (SOURCE_URL or ""))
     if is_mediafire:
         report_progress("downloading", 10, "Connecting to MediaFire source...", force=True)
-        return mediafire_download(file_id, dest_path)
+        success = mediafire_download(file_id, dest_path)
+        if success and os.path.exists(dest_path):
+            ok, reason = verify_archive_integrity(dest_path, FILE_NAME)
+            if not ok:
+                print(f"  MediaFire download failed integrity check: {reason}")
+                try:
+                    os.unlink(dest_path)
+                except Exception:
+                    pass
+                return False
+            print(f"  MediaFire download verified intact: {reason}")
+            return True
+        return False
 
-    # ─── Google Drive Cascade ───
-    # ─── Approach 1A: GAS Copy ───
-    report_progress("downloading", 5, "Trying GAS copy...", force=True)
-    if gas_try_copy(file_id, dest_path):
-        return True
+    # ─── Google Drive Cascade with Integrity Verification ───
+    methods = [
+        ("GAS copy", 5, lambda: gas_try_copy(file_id, dest_path)),
+        ("GAS folder download", 10, lambda: gas_try_folder_download(file_id, dest_path)),
+        ("Web download URL", 15, lambda: web_download(file_id, dest_path)),
+        ("API download", 20, lambda: api_download(file_id, dest_path)),
+    ]
 
-    # ─── Approach 1B: GAS Folder + Signed URL ───
-    report_progress("downloading", 10, "Trying GAS folder download...")
-    if gas_try_folder_download(file_id, dest_path):
-        return True
+    for attempt in range(1, 3):
+        if attempt > 1:
+            print(f"  Retrying Google Drive cascade (pass {attempt}/2)...")
+            time.sleep(3)
 
-    # ─── Approach 2: Web download URL ───
-    report_progress("downloading", 15, "Trying web download URL...")
-    if web_download(file_id, dest_path):
-        return True
+        for name, pct, method in methods:
+            report_progress("downloading", pct, f"Trying {name}...", force=True)
+            try:
+                success = method()
+            except Exception as e:
+                print(f"  {name} raised exception: {e}")
+                success = False
 
-    # ─── Approach 3: Standard API ───
-    report_progress("downloading", 20, "Trying API download...")
-    if api_download(file_id, dest_path):
-        return True
+            if success and os.path.exists(dest_path):
+                ok, reason = verify_archive_integrity(dest_path, FILE_NAME)
+                if ok:
+                    print(f"  Download verified intact via {name}: {reason}")
+                    return True
+                else:
+                    print(f"  Download via {name} failed integrity check: {reason}")
+                    try:
+                        os.unlink(dest_path)
+                    except Exception:
+                        pass
+                    print(f"  Discarded corrupt file, falling through to next download method...")
 
     return False
 
@@ -497,11 +601,24 @@ def mediafire_download(file_id: str, dest_path: str) -> bool:
                     report_progress("downloading", pct,
                                     f"Downloaded {downloaded // (1024*1024)} / {total // (1024*1024)} MB")
 
-        if os.path.getsize(dest_path) < 100:
+        size = os.path.getsize(dest_path)
+        if size < 100:
             print("  MediaFire downloaded file is too small (<100 bytes)")
+            try:
+                os.unlink(dest_path)
+            except Exception:
+                pass
             return False
 
-        print(f"  MediaFire download successful: {os.path.getsize(dest_path)} bytes")
+        if total > 0 and size != total:
+            print(f"  MediaFire download incomplete: got {size:,} bytes, expected {total:,} bytes")
+            try:
+                os.unlink(dest_path)
+            except Exception:
+                pass
+            return False
+
+        print(f"  MediaFire download successful: {size:,} bytes")
         return True
 
     except Exception as e:
@@ -613,7 +730,15 @@ def stream_download(url: str, dest_path: str, auth: str = None, params: dict = N
     if auth:
         headers["Authorization"] = auth
 
-    resp = requests.get(url, headers=headers, params=params, stream=True, timeout=30, allow_redirects=True)
+    try:
+        resp = requests.get(url, headers=headers, params=params, stream=True, timeout=30, allow_redirects=True)
+    except Exception as e:
+        print(f"  Stream request failed: {e}")
+        return False
+
+    if resp.status_code != 200:
+        print(f"  Download returned HTTP status {resp.status_code}")
+        return False
 
     # Reject obvious HTML error pages (Google returns 200 + text/html for quota errors)
     content_type = resp.headers.get("Content-Type", "")
@@ -642,13 +767,28 @@ def stream_download(url: str, dest_path: str, auth: str = None, params: dict = N
     if b"<!DOCTYPE" in head or b"<html" in head or b"Quota exceeded" in head:
         snippet = head[:200].decode("utf-8", errors="replace")
         print(f"  Download is HTML despite Content-Type ({content_type}): {snippet[:150]}")
-        os.unlink(dest_path)
+        try:
+            os.unlink(dest_path)
+        except Exception:
+            pass
         return False
 
     # Reject suspiciously small files (any real firmware ZIP is at least several MB)
     if size < 1024:
         print(f"  Download too small: {size} bytes (expected a real file, not an error page)")
-        os.unlink(dest_path)
+        try:
+            os.unlink(dest_path)
+        except Exception:
+            pass
+        return False
+
+    # Reject truncated downloads if Content-Length was provided
+    if total > 0 and size != total:
+        print(f"  Download incomplete: got {size:,} bytes, expected {total:,} bytes")
+        try:
+            os.unlink(dest_path)
+        except Exception:
+            pass
         return False
 
     print(f"  Downloaded {size:,} bytes")
@@ -706,9 +846,6 @@ def should_exclude(entry_name: str) -> bool:
             return True
     return False
 
-
-EXTRACTABLE_EXTENSIONS = {'.zip', '.rar', '.7z', '.tar', '.gz', '.tgz', '.bz2', '.xz'}
-STANDALONE_EXTENSIONS  = {'.iso', '.img', '.pac', '.bin', '.exe', '.tar.md5'}
 
 def is_extractable_archive(filepath: str, original_name: str) -> bool:
     """Check if the downloaded file is a compressed archive that should be unpacked."""
@@ -901,11 +1038,17 @@ def process_archive(source_path: str, output_path: str, original_name: str,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if res.returncode == 0:
                 extracted = True
+            else:
+                err_output = res.stderr.decode("utf-8", errors="replace").strip() or res.stdout.decode("utf-8", errors="replace").strip()
+                err_lines = [line.strip() for line in err_output.splitlines() if line.strip()]
+                short_err = " | ".join(err_lines[-3:]) if err_lines else f"exit code {res.returncode}"
+                print(f"  7z extraction returned code {res.returncode}: {short_err}")
         except FileNotFoundError:
             pass
 
         # Fallback to Python zipfile if 7z isn't available and it's a zip
         if not extracted and zipfile.is_zipfile(source_path):
+            print("  Attempting extraction via Python zipfile fallback...")
             with zipfile.ZipFile(source_path, "r") as zf:
                 zf.extractall(staging_dir)
             extracted = True
@@ -1107,13 +1250,15 @@ def main():
 
         # If dual build, upload the clean version too
         hf_url_clean = ""
+        clean_size = 0
         if DUAL_BUILD and clean_path and os.path.exists(clean_path):
             clean_hf_name = f"{FILE_ID}/{base_name}.zip"
+            clean_size = os.path.getsize(clean_path)
             hf_url_clean = upload_to_hf(clean_path, clean_hf_name)
-            print(f"  Clean version uploaded ({FILE_ID})")
+            print(f"  Clean version uploaded ({FILE_ID}, {clean_size} bytes)")
 
         # ─── Step 6: Report completion ───
-        report_complete(hf_url, processed_size)
+        report_complete(hf_url, processed_size, hf_url_clean, clean_size)
 
         print("\n" + "=" * 60)
         print("BUILD SUCCESSFUL")
