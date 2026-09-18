@@ -458,7 +458,13 @@ def download_file(file_id: str, dest_path: str) -> bool:
     is_mega = (SOURCE_TYPE == "mega") or file_id.startswith("mega_") or is_mega_url(SOURCE_URL or "")
     if is_mega:
         report_progress("downloading", 10, "Connecting to MEGA source...", force=True)
-        ok, real_name = mega_download(file_id, SOURCE_URL or "", dest_path)
+
+        def on_mega_dl_progress(pct: int, msg: str):
+            overall_pct = 10 + int(pct * 0.65)
+            clean_msg = msg[:90] if msg else f"{pct}%"
+            report_progress("downloading", overall_pct, f"Downloading from MEGA ({clean_msg})")
+
+        ok, real_name = mega_download(file_id, SOURCE_URL or "", dest_path, progress_callback=on_mega_dl_progress)
         if not ok:
             return False
         if real_name and not is_generic_filename(real_name):

@@ -42,20 +42,22 @@ check("folder rejected", ok, False)
 print("\n--- mocked successful download ---")
 md.MEGA_BIN = "/usr/bin/true"
 
-class FakeProc:
-    returncode = 0
-    stderr = ""
+class FakePopen:
+    def __init__(self, cmd, stdout=None, stderr=None, stdin=None, text=True, bufsize=1):
+        self.returncode = 0
+        path_idx = cmd.index("--path") + 1
+        out_dir = cmd[path_idx]
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "Tecno_Pouvoir_3_LB7_MT6739_V213_190425.zip"), "wb") as f:
+            f.write(b"\x00" * 1024)
+        import io
+        self.stderr = io.StringIO("Downloading: 100%\n")
+        self.stdout = io.StringIO("")
 
-def fake_run(cmd, capture_output, text, timeout):
-    # Simulate megatools writing the real (decrypted) filename into --path
-    path_idx = cmd.index("--path") + 1
-    out_dir = cmd[path_idx]
-    os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "Tecno_Pouvoir_3_LB7_MT6739_V213_190425.zip"), "wb") as f:
-        f.write(b"\x00" * 1024)
-    return FakeProc()
+    def wait(self, timeout=None):
+        return self.returncode
 
-md.subprocess.run = fake_run
+md.subprocess.Popen = FakePopen
 ok, name = md.mega_download("mega_d6IXQCab", VALID_URL, dest)
 check("succeeds", ok, True)
 check("real filename recovered", name, "Tecno_Pouvoir_3_LB7_MT6739_V213_190425.zip")
@@ -64,16 +66,19 @@ check("tmp dir cleaned up", os.path.exists(os.path.join(work, ".mega_dl_d6IXQCab
 
 # --- mocked non-zero exit (e.g. bandwidth limit) ---
 print("\n--- mocked megatools failure (bandwidth limit style) ---")
-class FailProc:
-    returncode = 1
-    stderr = "err: bandwidth limit exceeded, wait or log in"
+class FailPopen:
+    def __init__(self, cmd, stdout=None, stderr=None, stdin=None, text=True, bufsize=1):
+        self.returncode = 1
+        path_idx = cmd.index("--path") + 1
+        os.makedirs(cmd[path_idx], exist_ok=True)
+        import io
+        self.stderr = io.StringIO("err: bandwidth limit exceeded, wait or log in\n")
+        self.stdout = io.StringIO("")
 
-def fake_run_fail(cmd, capture_output, text, timeout):
-    path_idx = cmd.index("--path") + 1
-    os.makedirs(cmd[path_idx], exist_ok=True)
-    return FailProc()
+    def wait(self, timeout=None):
+        return self.returncode
 
-md.subprocess.run = fake_run_fail
+md.subprocess.Popen = FailPopen
 ok, name = md.mega_download("mega_d6IXQCab", VALID_URL, dest + "2")
 check("propagates failure", ok, False)
 check("no filename on failure", name, None)

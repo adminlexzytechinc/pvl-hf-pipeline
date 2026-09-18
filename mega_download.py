@@ -9,17 +9,20 @@ Drop-in shape matches mediafire_download(file_id, dest_path) -> bool so it
 slots into download_from_source() the same way.
 """
 
+import io
 import os
 import re
 import shutil
 import subprocess
+import sys
+import time
 
 from mega_url import is_mega_url, parse_mega_url
 
 MEGA_BIN = shutil.which("megatools")
 
 
-def mega_download(file_id: str, source_url: str, dest_path: str):
+def mega_download(file_id: str, source_url: str, dest_path: str, progress_callback=None):
     """
     Download a MEGA file link to dest_path.
 
@@ -66,28 +69,69 @@ def mega_download(file_id: str, source_url: str, dest_path: str):
     try:
         # --path is a directory: megatools names the file itself from the
         # link's own (decrypted) metadata, so we don't have to guess it.
-        cmd = [MEGA_BIN, "dl", "--path", tmp_dir, "--no-progress"]
+        # We do NOT pass --no-progress: megatools streams progress to stderr,
+        # which we display live in the GitHub Actions runner log and forward
+        # to the WordPress callback so the build does not appear stuck.
+        cmd = [MEGA_BIN, "dl", "--path", tmp_dir]
         mega_user = os.environ.get("MEGA_USER")
         mega_pass = os.environ.get("MEGA_PASS")
         if mega_user and mega_pass:
             cmd.extend(["--username", mega_user, "--password", mega_pass])
         cmd.append(source_url)
 
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True, text=True, timeout=3600 * 6,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
         )
+
+        last_report_time = 0
+        last_pct = -1
+        err_lines = []
+        buf = []
+
+        while True:
+            char = proc.stderr.read(1)
+            if not char:
+                break
+            if char in ('\r', '\n'):
+                line = ''.join(buf).strip()
+                buf = []
+                if line:
+                    err_lines.append(line)
+                    if len(err_lines) > 50:
+                        err_lines.pop(0)
+                    # Stream live progress to console for GitHub Actions log
+                    sys.stdout.write(f"\r  {line}   ")
+                    sys.stdout.flush()
+
+                    m = re.search(r'(\d{1,3})%', line)
+                    if m and progress_callback:
+                        pct = int(m.group(1))
+                        now = time.time()
+                        if pct != last_pct and (now - last_report_time >= 5 or pct in (25, 50, 75, 100)):
+                            last_pct = pct
+                            last_report_time = now
+                            try:
+                                progress_callback(pct, line)
+                            except Exception:
+                                pass
+            else:
+                buf.append(char)
+
+        proc.wait(timeout=3600 * 6)
+        print()  # Ensure newline after progress carriage returns
     except subprocess.TimeoutExpired:
         print("  MEGA download error: timed out after 6 hours")
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return False, None
 
     if proc.returncode != 0:
-        # megatools' own stderr already says the useful thing (bandwidth
-        # limit exceeded, link expired/removed, etc.) -- surface it verbatim
-        # rather than paraphrasing, since the exact wording is what you'd
-        # grep the retry-queue error column for.
-        print(f"  MEGA download failed (exit {proc.returncode}): {proc.stderr.strip()}")
+        err_msg = "\n".join(err_lines[-5:]) if err_lines else f"exit {proc.returncode}"
+        print(f"  MEGA download failed (exit {proc.returncode}): {err_msg}")
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return False, None
 
