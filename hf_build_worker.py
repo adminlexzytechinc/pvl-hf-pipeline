@@ -41,6 +41,7 @@ from huggingface_hub import HfApi
 from mega_url import is_mega_url
 from mega_download import mega_download
 from source_labels import source_label
+import dedup_client
 
 # ─────────────────────────────────────────────
 #  Configuration
@@ -60,6 +61,15 @@ EXCLUDE_PATTERNS    = [p.strip() for p in os.environ.get("EXCLUDE_PATTERNS", "")
 SOURCE_TYPE         = os.environ.get("SOURCE_TYPE", "gdrive").strip().lower()
 SOURCE_URL          = os.environ.get("SOURCE_URL", "").strip()
 DUAL_BUILD          = os.environ.get("DUAL_BUILD", "false").strip().lower() in ("true", "1", "yes")
+# Serve-time branding: store ONE brand-neutral artifact and let the Cloudflare
+# Worker append the branding per request. When this is on, the build produces no
+# branding files and no branded folder name, so the stored payload is byte-identical
+# for every brand -- which is the whole point (see drive-architecture.md, 0.2).
+# It supersedes DUAL_BUILD: there is nothing to dual-build when the only stored
+# artifact is already the clean one.
+SERVE_TIME_BRANDING = os.environ.get("SERVE_TIME_BRANDING", "false").strip().lower() in ("true", "1", "yes")
+if SERVE_TIME_BRANDING:
+    DUAL_BUILD = False
 
 DRIVE_API_BASE   = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3"
@@ -289,6 +299,28 @@ def report_error(message: str):
             "stage":    "error",
             "percent":  0,
             "message":  message,
+        }, timeout=10)
+    except Exception:
+        pass
+
+
+def report_duplicate(existing_file_id: str, reason: str = ""):
+    """Tell WordPress this source is already indexed, so no build was run.
+
+    Sent as its own stage rather than an error: nothing went wrong, and the
+    caller needs to distinguish "we already have this" from "the build failed"
+    to avoid queueing a pointless retry.
+    """
+    print(f"[100%] Duplicate: already indexed as {existing_file_id} ({reason})")
+    try:
+        requests.post(CALLBACK_URL, json={
+            "build_id": BUILD_ID,
+            "file_id":  FILE_ID,
+            "secret":   CALLBACK_SECRET,
+            "stage":    "duplicate",
+            "percent":  100,
+            "message":  "Already cached from another source",
+            "duplicate_of": existing_file_id,
         }, timeout=10)
     except Exception:
         pass
@@ -1067,20 +1099,24 @@ def repack_staging_to_zip(staging_dir: str, output_zip_path: str, root_folder: s
 
 
 def process_archive(source_path: str, output_path: str, original_name: str,
-                    root_folder: str = "", clean_output_path: str = "") -> dict:
+                    root_folder: str = "", clean_output_path: str = "",
+                    add_branding: bool = True) -> dict:
     """
     Extract archive (.rar, .7z, .zip, .tar), filter exclusions,
-    restructure into firmware/ subfolder, add brand text files,
+    restructure into firmware/ subfolder, optionally add brand text files,
     and repack into a clean ZIP archive.
 
     Internal filenames are NEVER modified -- only excluded files are removed.
 
     Args:
         source_path: Path to the downloaded archive
-        output_path: Destination for the branded ZIP
+        output_path: Destination for the ZIP
         original_name: Original filename (for extraction fallback)
-        root_folder: Top-level folder name inside the branded ZIP
+        root_folder: Top-level folder name inside the ZIP
         clean_output_path: If set, also build a clean (unbranded) ZIP here
+        add_branding: Write the branding files into the archive. False under
+            SERVE_TIME_BRANDING, where the Worker appends them per request and
+            the stored payload must stay brand-neutral.
     """
     report_progress("processing", 81, "Extracting archive contents...", force=True)
     staging_dir = tempfile.mkdtemp(prefix="pvl_stage_")
@@ -1128,11 +1164,14 @@ def process_archive(source_path: str, output_path: str, original_name: str,
             repack_staging_to_zip(staging_dir, clean_output_path, root_folder=clean_folder)
             print(f"  Clean ZIP built: {clean_folder}.zip")
 
-        # Add branding files at root (outside firmware/)
-        _write_branding_files(staging_dir)
+        if add_branding:
+            # Add branding files at root (outside firmware/)
+            _write_branding_files(staging_dir)
+            report_progress("processing", 84, "Packaging branded ZIP...", force=True)
+        else:
+            # Serve-time branding: nothing brand-specific goes in the archive.
+            report_progress("processing", 84, "Packaging brand-neutral ZIP...", force=True)
 
-        # Repack branded version (firmware/ + branding files)
-        report_progress("processing", 84, "Packaging branded ZIP...", force=True)
         repack_staging_to_zip(staging_dir, output_path, root_folder=root_folder)
 
         print(f"  Processed archive: {stats['kept']} files kept, {stats['excluded']} excluded, "
@@ -1144,7 +1183,7 @@ def process_archive(source_path: str, output_path: str, original_name: str,
 
 
 def package_standalone_file(raw_path: str, output_path: str, original_name: str,
-                           root_folder: str = ""):
+                           root_folder: str = "", add_branding: bool = True):
     """
     For disk images (.iso) and standalone binaries (.pac, .img, .bin):
     Place the intact file into firmware/ subfolder under its EXACT original name,
@@ -1171,11 +1210,13 @@ def package_standalone_file(raw_path: str, output_path: str, original_name: str,
                     break
                 dst.write(chunk)
 
-        # Write branding files at root level (outside firmware/)
-        brand_prefix = f"{root_prefix}/" if root_prefix else ""
-        out_zip.writestr(f"{brand_prefix}Downloaded from {BRAND_NAME}.txt", WATERMARK_BRAND)
-        out_zip.writestr(f"{brand_prefix}README - Download Info.txt", WATERMARK_README)
-        out_zip.writestr(f"{brand_prefix}{BRAND_NAME}.url", WATERMARK_URL)
+        # Write branding files at root level (outside firmware/).
+        # Skipped under SERVE_TIME_BRANDING -- the Worker appends them instead.
+        if add_branding:
+            brand_prefix = f"{root_prefix}/" if root_prefix else ""
+            out_zip.writestr(f"{brand_prefix}Downloaded from {BRAND_NAME}.txt", WATERMARK_BRAND)
+            out_zip.writestr(f"{brand_prefix}README - Download Info.txt", WATERMARK_README)
+            out_zip.writestr(f"{brand_prefix}{BRAND_NAME}.url", WATERMARK_URL)
 
     print(f"  Packaged standalone file: {original_name} (unchanged name)")
 
@@ -1220,6 +1261,12 @@ def main():
     print(f"  Callback:   [configured]")
     print(f"  Dual Build: {DUAL_BUILD}")
     print("=" * 60)
+
+    # Declared before the try so the failure handler can release a reservation
+    # taken partway through.
+    reserve_token = ""
+    source_sha = ""
+    verdict = {}
 
     work_dir = tempfile.mkdtemp(prefix="pvl_build_")
     raw_path = os.path.join(work_dir, "raw_download")
@@ -1272,6 +1319,51 @@ def main():
         report_progress("downloading", 80,
                         f"Download complete ({raw_size // (1024*1024)} MB)", force=True)
 
+        # ─── Step 2b: SOURCE dedup, before anything expensive ───
+        #
+        # Deliberately here: after the download, before the repack. Hashing the
+        # OUTPUT would be useless for the actual goal -- the repack writes
+        # branding files with fresh timestamps and a source-derived folder
+        # name, so the same firmware from two mirrors produces two different
+        # output hashes. Only the raw source bytes are comparable across
+        # mirrors.
+        report_progress("dedup", 80, "Checking for an existing copy...", force=True)
+        source_sha = dedup_client.sha256_file(raw_path)
+        print(f"  Source SHA-256: {source_sha}")
+
+        verdict = dedup_client.check(
+            source_sha,
+            size_bytes=raw_size,
+            build_id=BUILD_ID,
+            file_id=FILE_ID,
+            source_url=SOURCE_URL,
+            source_type=SOURCE_TYPE,
+        )
+
+        if verdict.get("duplicate"):
+            # Already indexed from another mirror. No build, no upload, no HF
+            # quota spent -- this is the saving the whole feature exists for.
+            report_duplicate(verdict.get("file_id", ""), verdict.get("reason", ""))
+            print("")
+            print("=" * 60)
+            print("BUILD SKIPPED -- source already indexed")
+            print(f"  Existing file: {verdict.get('file_id')}")
+            print("=" * 60)
+            return
+
+        if verdict.get("wait"):
+            # Another build holds this exact source. Exiting non-zero lets the
+            # retry queue pick it up after that build finishes or its
+            # reservation expires; racing it would create the duplicate we are
+            # trying to avoid.
+            wait_for = verdict.get("retry_after", 60)
+            report_error(f"Another build is already processing this file. Retry in ~{wait_for}s.")
+            sys.exit(75)   # EX_TEMPFAIL
+
+        reserve_token = verdict.get("reserve_token", "")
+        if verdict.get("unchecked"):
+            print(f"  Proceeding without a dedup check: {verdict.get('reason', '')}")
+
         # ─── Step 3: Compute branded name BEFORE processing ───
         # clean_watermarks() is ONLY applied to the outer archive name, never internal files
         cleaned_name = clean_watermarks(original_name)
@@ -1282,19 +1374,37 @@ def main():
         if is_generic_filename(base_name):
             base_name = FILE_ID
         branded_name = f"{base_name} - {BRAND_NAME}.zip"
-        root_folder = os.path.splitext(branded_name)[0]  # folder name = zip name minus .zip
+
+        # The name the artifact is STORED under, and the top-level folder inside it.
+        #
+        # Under serve-time branding both must be brand-neutral. The brand used to
+        # be baked into every ZIP entry path via root_folder, which would make the
+        # payload prefix differ per brand and defeat the whole scheme -- the Worker
+        # can only append to bytes that are shared across brands.
+        if SERVE_TIME_BRANDING:
+            stored_name = f"{base_name}.zip"
+        else:
+            stored_name = branded_name
+        root_folder = os.path.splitext(stored_name)[0]  # folder name = zip name minus .zip
+
         print(f"  Original name: {original_name}")
         print(f"  Cleaned name:  {cleaned_name}")
-        print(f"  Branded name:  {branded_name}")
+        print(f"  Stored name:   {stored_name}")
+        if SERVE_TIME_BRANDING:
+            print(f"  Branding:      serve-time (Worker appends; archive stays neutral)")
+        else:
+            print(f"  Branded name:  {branded_name}")
 
         # ─── Step 4: Process the File ───
         if is_extractable_archive(raw_path, original_name):
             stats = process_archive(raw_path, processed_path, original_name,
                                     root_folder=root_folder,
-                                    clean_output_path=clean_path if DUAL_BUILD else "")
+                                    clean_output_path=clean_path if DUAL_BUILD else "",
+                                    add_branding=not SERVE_TIME_BRANDING)
         else:
             package_standalone_file(raw_path, processed_path, original_name,
-                                   root_folder=root_folder)
+                                   root_folder=root_folder,
+                                   add_branding=not SERVE_TIME_BRANDING)
 
         processed_size = os.path.getsize(processed_path)
         report_progress("processing", 85,
@@ -1306,17 +1416,41 @@ def main():
             sys.exit(1)
 
         # ─── Step 5: Upload to Hugging Face ───
-        hf_filename = f"{FILE_ID}/{branded_name}"
+        hf_filename = f"{FILE_ID}/{stored_name}"
         hf_url = upload_to_hf(processed_path, hf_filename)
 
         # If dual build, upload the clean version too
         hf_url_clean = ""
         clean_size = 0
-        if DUAL_BUILD and clean_path and os.path.exists(clean_path):
+        if SERVE_TIME_BRANDING:
+            # One artifact serves both variants: it IS the clean one, and the
+            # Worker derives the branded stream from it. Reporting it as both
+            # lets pvl_hf_masked_url() resolve either variant to these bytes.
+            hf_url_clean = hf_url
+            clean_size = processed_size
+        elif DUAL_BUILD and clean_path and os.path.exists(clean_path):
             clean_hf_name = f"{FILE_ID}/{base_name}.zip"
             clean_size = os.path.getsize(clean_path)
             hf_url_clean = upload_to_hf(clean_path, clean_hf_name)
             print(f"  Clean version uploaded ({FILE_ID}, {clean_size} bytes)")
+
+        # ─── Step 5b: Confirm the reservation ───
+        #
+        # Stage 2 (output dedup): the artifact hash is cheap insurance against
+        # re-runs and re-uploads. Stage 1 above is what actually solves the
+        # cross-mirror problem.
+        content_sha = dedup_client.sha256_file(processed_path)
+        print(f"  Content SHA-256: {content_sha}")
+
+        if reserve_token:
+            confirmation = dedup_client.confirm(source_sha, reserve_token, FILE_ID, content_sha)
+            twin = confirmation.get("content_duplicate_of")
+            if twin:
+                print(f"  Note: identical artifact already stored as {twin}")
+        elif verdict.get("unchecked"):
+            # We uploaded without a check. Record it so it can be reconciled
+            # rather than accumulating invisibly.
+            dedup_client.record_unchecked(FILE_ID, source_sha, verdict.get("reason", ""))
 
         # ─── Step 6: Report completion ───
         report_complete(hf_url, processed_size, hf_url_clean, clean_size)
@@ -1333,6 +1467,13 @@ def main():
         raise
     except Exception as e:
         traceback.print_exc()
+        # Hand the hash back before giving up, or a crashed build blocks it for
+        # the full reservation TTL and an immediate retry is told to wait.
+        try:
+            if reserve_token:
+                dedup_client.release(source_sha, reserve_token)
+        except Exception:
+            pass
         report_error(f"Build failed: {str(e)}")
         sys.exit(1)
     finally:
