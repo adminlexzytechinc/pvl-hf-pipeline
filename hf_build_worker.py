@@ -40,6 +40,7 @@ from huggingface_hub import HfApi
 
 from mega_url import is_mega_url
 from mega_download import mega_download
+from source_labels import source_label
 
 # ─────────────────────────────────────────────
 #  Configuration
@@ -454,15 +455,20 @@ def download_file(file_id: str, dest_path: str) -> bool:
     """
     global FILE_NAME
 
+    # Resolve the display name ONCE, from the same signals the branches below
+    # test. Previously each branch spelled its own brand name by hand, which
+    # is how a Google Drive build could surface "Connecting to MEGA source...".
+    SRC = source_label(SOURCE_TYPE, file_id, SOURCE_URL or "")
+
     # ─── MEGA Source ───
     is_mega = (SOURCE_TYPE == "mega") or file_id.startswith("mega_") or is_mega_url(SOURCE_URL or "")
     if is_mega:
-        report_progress("downloading", 10, "Connecting to MEGA source...", force=True)
+        report_progress("downloading", 10, f"Connecting to {SRC}...", force=True)
 
         def on_mega_dl_progress(pct: int, msg: str):
             overall_pct = 10 + int(pct * 0.65)
             clean_msg = msg[:90] if msg else f"{pct}%"
-            report_progress("downloading", overall_pct, f"Downloading from MEGA ({clean_msg})")
+            report_progress("downloading", overall_pct, f"Downloading from {SRC} ({clean_msg})")
 
         ok, real_name = mega_download(file_id, SOURCE_URL or "", dest_path, progress_callback=on_mega_dl_progress)
         if not ok:
@@ -485,7 +491,7 @@ def download_file(file_id: str, dest_path: str) -> bool:
     # ─── MediaFire Source ───
     is_mediafire = (SOURCE_TYPE == "mediafire") or file_id.startswith("mf_") or ("mediafire.com" in (SOURCE_URL or ""))
     if is_mediafire:
-        report_progress("downloading", 10, "Connecting to MediaFire source...", force=True)
+        report_progress("downloading", 10, f"Connecting to {SRC}...", force=True)
         success = mediafire_download(file_id, dest_path)
         if success and os.path.exists(dest_path):
             ok, reason = verify_archive_integrity(dest_path, FILE_NAME)
@@ -514,7 +520,11 @@ def download_file(file_id: str, dest_path: str) -> bool:
             time.sleep(3)
 
         for name, pct, method in methods:
-            report_progress("downloading", pct, f"Trying {name}...", force=True)
+            # Strategy names ("GAS copy", "API download") are internal
+            # quota-workaround details. They go to the build log only; the
+            # user sees one steady message naming the actual source.
+            print(f"  Strategy: {name}")
+            report_progress("downloading", pct, f"Fetching from {SRC}...", force=True)
             try:
                 success = method()
             except Exception as e:

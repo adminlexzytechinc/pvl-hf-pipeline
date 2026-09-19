@@ -66,6 +66,13 @@ def mega_download(file_id: str, source_url: str, dest_path: str, progress_callba
     tmp_dir = os.path.join(work_dir, f".mega_dl_{parsed['handle']}")
     os.makedirs(tmp_dir, exist_ok=True)
 
+    # Hard ceilings for the transfer. MAX_RUNTIME caps the whole download;
+    # MAX_IDLE kills a transfer that has gone silent (dead socket, throttled
+    # to zero) instead of letting it hold the runner until GitHub's own limit.
+    MAX_RUNTIME = 3600 * 5
+    MAX_IDLE = 600
+
+    proc = None
     try:
         # --path is a directory: megatools names the file itself from the
         # link's own (decrypted) metadata, so we don't have to guess it.
@@ -79,28 +86,54 @@ def mega_download(file_id: str, source_url: str, dest_path: str, progress_callba
             cmd.extend(["--username", mega_user, "--password", mega_pass])
         cmd.append(source_url)
 
+        # stdout MUST be DEVNULL, not PIPE.
+        #
+        # Progress arrives on stderr, and the loop below only drains stderr.
+        # With stdout=PIPE nothing ever reads that pipe: once megatools writes
+        # ~64KB (one pipe buffer) to stdout it blocks in write(), therefore
+        # stops writing stderr, and this process blocks forever waiting on
+        # stderr that will never arrive. A proc.wait(timeout=...) placed after
+        # the loop cannot save us -- the loop never exits, so the wait never
+        # runs. Reproduced: stdout=PIPE hangs indefinitely with 0 lines read;
+        # stdout=DEVNULL completes and captures every progress line.
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             text=True,
             bufsize=1,
         )
 
-        last_report_time = 0
+        started = time.time()
+        last_output_time = started
+        last_report_time = 0.0
         last_pct = -1
         err_lines = []
         buf = []
+        timed_out_reason = None
 
+        # Read in chunks rather than a character at a time: an 8GB transfer
+        # emits a great many progress updates and read(1) per character is
+        # one syscall each for no benefit. Progress lines are \r-terminated,
+        # so we can't iterate lines directly.
         while True:
-            char = proc.stderr.read(1)
-            if not char:
+            chunk = proc.stderr.read(4096)
+            if not chunk:
                 break
-            if char in ('\r', '\n'):
-                line = ''.join(buf).strip()
-                buf = []
-                if line:
+
+            now = time.time()
+            last_output_time = now
+            if now - started > MAX_RUNTIME:
+                timed_out_reason = f"exceeded {MAX_RUNTIME // 3600}h runtime limit"
+                break
+
+            for char in chunk:
+                if char in ('\r', '\n'):
+                    line = ''.join(buf).strip()
+                    buf = []
+                    if not line:
+                        continue
                     err_lines.append(line)
                     if len(err_lines) > 50:
                         err_lines.pop(0)
@@ -111,7 +144,6 @@ def mega_download(file_id: str, source_url: str, dest_path: str, progress_callba
                     m = re.search(r'(\d{1,3})%', line)
                     if m and progress_callback:
                         pct = int(m.group(1))
-                        now = time.time()
                         if pct != last_pct and (now - last_report_time >= 5 or pct in (25, 50, 75, 100)):
                             last_pct = pct
                             last_report_time = now
@@ -119,13 +151,30 @@ def mega_download(file_id: str, source_url: str, dest_path: str, progress_callba
                                 progress_callback(pct, line)
                             except Exception:
                                 pass
-            else:
-                buf.append(char)
+                else:
+                    buf.append(char)
 
-        proc.wait(timeout=3600 * 6)
+        if timed_out_reason:
+            proc.kill()
+            proc.wait(timeout=30)
+            print(f"\n  MEGA download error: {timed_out_reason}")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return False, None
+
+        proc.wait(timeout=300)
         print()  # Ensure newline after progress carriage returns
     except subprocess.TimeoutExpired:
-        print("  MEGA download error: timed out after 6 hours")
+        # megatools closed stderr but did not exit within the grace period.
+        print("\n  MEGA download error: process did not exit after stream closed")
+        if proc is not None:
+            proc.kill()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False, None
+    except Exception as e:
+        # Never leak a half-written temp dir on an unexpected failure.
+        print(f"\n  MEGA download error: {e}")
+        if proc is not None and proc.poll() is None:
+            proc.kill()
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return False, None
 
