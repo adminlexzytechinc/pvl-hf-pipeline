@@ -199,6 +199,40 @@ def is_generic_filename(name: str) -> bool:
 
     return False
 
+# Shared with pvl_strip_site_watermarks() in pvl-engine/pvl-match.php and, through
+# it, firmware_clean_filename() in core.firmware.php. All three used to keep their
+# own hardcoded roster of competitor names, so a mirror nobody had added yet leaked
+# its domain into stored filenames. Keep the three in step.
+_WM_TLDS = 'com|net|org|info|co|in|io|xyz|biz|me|us|ru|ir|vn|id'
+_WM_EXTS = 'zip|rar|7z|pac|tar|gz|tgz|bz2|iso|bin|img|md5|ozip|kdz|dz|sin|ftf|nb0|app'
+# No hyphens in the label, 3 characters minimum, and a negative lookahead rather
+# than  -- underscore is a word character, so  does not fire between "com"
+# and "_". See the comment in pvl-match.php for what each of those prevents.
+_WM_DOMAIN = r'[a-z0-9]{3,}\.(?:' + _WM_TLDS + r')(?![a-z0-9])'
+
+
+def strip_site_watermarks(filename: str) -> str:
+    """Remove any domain-shaped token from a filename, keeping the extension."""
+    if not filename:
+        return ""
+
+    ext = ""
+    m = _re.match(r'^(.*?)(\.(?:' + _WM_EXTS + r'))$', filename, _re.I)
+    if m:
+        filename, ext = m.group(1), m.group(2)
+
+    filename = _re.sub(r'[\s_-]*\[[^\]]*\][\s_-]*', '_', filename)
+    filename = _re.sub(r'^[\s_(\[-]*(?:up[_\s-]+)?(?:www\.)?' + _WM_DOMAIN + r'[)\]_\s-]*',
+                       '', filename, flags=_re.I)
+    filename = _re.sub(r'[_\-\s]*(?:by[_\s-]*)?[(\[]?\s*(?:www\.)?' + _WM_DOMAIN + r'.*$',
+                       '', filename, flags=_re.I)
+    filename = _re.sub(r'_{2,}', '_', filename)
+    filename = _re.sub(r'-{2,}', '-', filename)
+    filename = filename.strip(' 	_-([')
+
+    return filename + ext
+
+
 def clean_watermarks(filename: str) -> str:
     """Strip third-party site watermarks from firmware filenames and archive entries.
     Mirrors firmware_clean_filename() from core.firmware.php.
@@ -255,6 +289,9 @@ def clean_watermarks(filename: str) -> str:
 
     # 16. Leading underscore/dash
     c = _re.sub(r'^[_-]+', '', c)
+
+    # 17. Generic pass: any remaining domain, named in the roster above or not.
+    c = strip_site_watermarks(c)
 
     return c.strip()
 
