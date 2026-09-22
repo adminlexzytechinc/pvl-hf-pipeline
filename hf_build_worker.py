@@ -211,8 +211,36 @@ _WM_EXTS = 'zip|rar|7z|pac|tar|gz|tgz|bz2|iso|bin|img|md5|ozip|kdz|dz|sin|ftf|nb
 _WM_DOMAIN = r'[a-z0-9]{3,}\.(?:' + _WM_TLDS + r')(?![a-z0-9])'
 
 
+def match_decode(text: str) -> str:
+    """Undo percent-encoding. Mirrors pvl_match_decode() in pvl-match.php.
+
+    Mirrors hand back href-encoded filenames and nothing upstream decodes
+    them, so "V551%20%282%29.zip" kept its escapes through every cleaning
+    rule -- the "(" and ")" patterns never matched -- and the identity keys
+    picked up "282" and "29" as digit-bearing tokens. The same build then
+    keyed differently depending on which mirror it arrived from.
+
+    unquote, never unquote_plus: "+" is a real character in device names
+    ("Pouvoir 4 Pro+") and unquote_plus would turn it into a space.
+    """
+    if not text or "%" not in text:
+        return text
+    # Decode to a fixed point. MediaFire hands back DOUBLE-encoded segments --
+    # "%2528" is an encoded "%28" is an encoded "(" -- so one pass leaves
+    # escapes the watermark rules cannot match. A fixed point is idempotent
+    # for free: fully decoded text decodes to itself. Bounded so nested input
+    # cannot spin.
+    for _ in range(4):
+        decoded = urllib.parse.unquote(text)
+        if decoded == text:
+            break
+        text = decoded
+    return text
+
+
 def strip_site_watermarks(filename: str) -> str:
     """Remove any domain-shaped token from a filename, keeping the extension."""
+    filename = match_decode(filename)
     if not filename:
         return ""
 
@@ -239,7 +267,7 @@ def clean_watermarks(filename: str) -> str:
     """
     if not filename:
         return ""
-    c = filename
+    c = match_decode(filename)
 
     # 1. Bracket watermarks at start: [up_addROM.com]_, [Hovatek], [NaijaROM], [FirmwareFile], etc.
     c = _re.sub(r'^\[[^\]]+\]\s*_?', '', c)
@@ -577,6 +605,9 @@ def download_file(file_id: str, dest_path: str) -> bool:
 
     # ─── Google Drive Cascade with Integrity Verification ───
     methods = [
+        # Free, no storage, no temp folder, no bridge -- and it works on files
+        # the public-link route reports as quota-blocked. Try it first.
+        ("Signed URL", 4, lambda: signed_url_download(file_id, dest_path)),
         ("GAS copy", 5, lambda: gas_try_copy(file_id, dest_path)),
         ("GAS folder download", 10, lambda: gas_try_folder_download(file_id, dest_path)),
         ("Web download URL", 15, lambda: web_download(file_id, dest_path)),
@@ -789,6 +820,39 @@ def gas_try_copy(file_id: str, dest_path: str) -> bool:
         return False
 
 
+def gas_poll_takeout(job_id: str, budget_s: int = 900) -> dict:
+    """Poll a Takeout export job the bridge started but could not finish.
+
+    Apps Script caps a run at ~6 minutes and a multi-gigabyte folder takes
+    longer than that to zip, so the bridge hands back the job id. The job
+    itself survives, so the only thing needed is patience -- and the runner
+    has plenty.
+    """
+    delays = [10, 15, 20, 30, 30, 45, 60, 60, 90, 90, 120, 120, 150]
+    spent = 0
+    for d in delays:
+        if spent >= budget_s:
+            break
+        time.sleep(d)
+        spent += d
+        try:
+            r = requests.get(GAS_BRIDGE_URL, params={
+                "action": "takeout_status",
+                "jobId":  job_id,
+                "secret": GAS_BRIDGE_SECRET,
+            }, timeout=60)
+            data = r.json()
+        except Exception as e:
+            print(f"  Takeout poll error: {e}")
+            continue
+        if data.get("success") and data.get("signedUrl"):
+            print(f"  Takeout job finished after {spent}s: "
+                  f"{data.get('fileName')} ({data.get('size')} bytes)")
+            return data
+        print(f"  Takeout job {job_id}: {data.get('status')} ({spent}s elapsed)")
+    return {}
+
+
 def gas_try_folder_download(file_id: str, dest_path: str) -> bool:
     """GAS Approach B: Folder + shortcut + signed URL."""
     try:
@@ -800,28 +864,214 @@ def gas_try_folder_download(file_id: str, dest_path: str) -> bool:
         }, timeout=120)
         data = resp.json()
 
+        # The bridge reports every endpoint it tried. Print them: "no signed
+        # URL" on its own says nothing, whereas "folder:anon 404, file:auth
+        # 303" says exactly where the mechanism stands.
+        for a in (data.get("attempts") or []):
+            if "error" in a:
+                print(f"    bridge {a.get('mode')}: error {a['error']}")
+            else:
+                print(f"    bridge {a.get('mode')}: HTTP {a.get('status')}, "
+                      f"location {a.get('location')}")
+
         if not data.get("success"):
             print(f"  GAS folder failed: {data.get('error', 'unknown')}")
+            # Older bridges hand back the temp folder id on failure and delete
+            # nothing, so every failed attempt used to leak a folder forever.
+            # Newer ones clean up themselves and say so with cleanedUp.
+            stale = data.get("folderId")
+            if stale and not data.get("cleanedUp"):
+                print(f"  Cleaning up leaked temp folder {stale}")
+                cleanup_gas_folder(stale)
             return False
 
-        folder_id  = data["folderId"]
+        # The bridge may still be zipping. The export job outlives its run,
+        # so keep polling instead of discarding the work.
+        if data.get("pending") and data.get("jobId"):
+            print(f"  Takeout job {data['jobId']} still building; polling")
+            data = gas_poll_takeout(data["jobId"]) or {}
+            for a in (data.get("attempts") or []):
+                print(f"    bridge {a.get('mode')}: {a.get('status')}")
+            if not data.get("signedUrl"):
+                print("  Takeout job did not finish in time")
+                return False
+
+        folder_id  = data.get("folderId")     # None when the file id worked
         signed_url = data["signedUrl"]
-        print(f"  GAS folder created: {folder_id}, got signed URL")
+        via = data.get("via", "folder")
 
-        # Download the folder ZIP
+        # A Takeout archive URL is SESSION BOUND. Fetched with no credentials
+        # it answers 302 -> accounts.google.com/ServiceLogin, even seconds
+        # after the job reports SUCCEEDED -- measured on a fresh job. So it
+        # must carry the identity that created it, which the bridge returns.
+        dl_auth = None
+        if data.get("requiresAuth") and data.get("token"):
+            dl_auth = "Bearer " + data["token"]
+            print("  Archive URL requires the bridge identity; using its token")
+        if data.get("fileName") and not is_generic_filename(data["fileName"]):
+            if data["fileName"] != FILE_NAME:
+                print(f"  Takeout reports filename {data['fileName']}")
+            FILE_NAME = data["fileName"]
+        if folder_id:
+            print(f"  GAS folder created: {folder_id}, got signed URL (via {via})")
+        else:
+            # The file-id path needs no temp folder at all, so there is
+            # nothing to clean up afterwards.
+            print(f"  GAS signed URL obtained with no temp folder (via {via})")
+
+        # Download the folder ZIP.
+        #
+        # Google zips a folder ASYNCHRONOUSLY. The signed URL is handed back
+        # immediately, but for a large folder the archive behind it does not
+        # exist yet -- a 9 GB folder takes minutes to assemble. A single
+        # attempt cannot tell "not ready yet" from "dead link".
+        #
+        # The old code took that single attempt and then called
+        # cleanup_gas_folder() on failure, which deletes the folder and with
+        # it the job URL. A slow zip was therefore indistinguishable from a
+        # broken one AND unrecoverable: there was nothing left to retry
+        # against. Poll with backoff, and only clean up once we have really
+        # given up.
         zip_path = dest_path + ".folder.zip"
-        if not stream_download(signed_url, zip_path, auth=None):
-            cleanup_gas_folder(folder_id)
+        RETRY_DELAYS = [0, 15, 30, 60, 120, 240]   # ~7.75 minutes total
+        downloaded = False
+        for i, delay in enumerate(RETRY_DELAYS):
+            if delay:
+                print(f"  Folder ZIP not ready; waiting {delay}s "
+                      f"(attempt {i + 1}/{len(RETRY_DELAYS)})")
+                time.sleep(delay)
+            if stream_download(signed_url, zip_path, auth=dl_auth):
+                downloaded = True
+                break
+        if not downloaded:
+            print(f"  Folder ZIP never became available after "
+                  f"{sum(RETRY_DELAYS)}s; giving up")
+            if folder_id:
+                cleanup_gas_folder(folder_id)
             return False
 
-        # Extract target file from the folder ZIP
-        success = extract_from_google_zip(zip_path, dest_path)
-        os.unlink(zip_path)
-        cleanup_gas_folder(folder_id)
+        # What comes back may or may not be a wrapper.
+        #
+        # Measured against four real archives downloaded this way: Google
+        # returns the ORIGINAL file, byte for byte, named after the folder
+        # with a "-001" suffix. Its contents are the firmware package's own
+        # structure, not a zip holding a zip.
+        #
+        # extract_from_google_zip() pulls out the single largest entry, so
+        # running it on such a file would keep the one big .pac and throw
+        # away Credits.txt, Driver/ and the package layout -- turning a
+        # complete package into a loose blob. Only unwrap when the archive
+        # really is a wrapper: one lone archive entry inside.
+        if looks_like_folder_wrapper(zip_path):
+            print("  Folder ZIP is a wrapper; extracting the archive inside")
+            success = extract_from_google_zip(zip_path, dest_path)
+            os.unlink(zip_path)
+        else:
+            print("  Folder ZIP is the firmware archive itself; keeping as-is")
+            os.replace(zip_path, dest_path)
+            success = True
+
+        if folder_id:
+            cleanup_gas_folder(folder_id)
         return success
 
     except Exception as e:
         print(f"  GAS folder error: {e}")
+        return False
+
+
+def signed_url_download(file_id: str, dest_path: str) -> bool:
+    """Approach 0: POST /uc for a signed URL, then stream it with no auth.
+
+    Google serves a public Drive file by two routes that do NOT behave alike.
+    Measured side by side on one file at one moment:
+
+        drive.usercontent.google.com/download?id=...   200  text/html
+        POST drive.google.com/uc?export=download&id=.. 303  -> signed URL
+          doc-0s-2c-docs.googleusercontent.com/...     206  application/zip
+
+    The first is the public-link route and carries the per-file download
+    quota; the second hands back a short-lived signed URL that serves the
+    bytes. web_download() and the WordPress probe both used the first, so a
+    file that downloads perfectly well was treated as quota-blocked and sent
+    down the GAS copy / temp-folder / manual path for nothing.
+
+    This costs nothing to try, needs no Drive storage, no temp folder and no
+    bridge, so it goes first in the cascade.
+
+    The POST needs a body: a bodyless POST to /uc answers 411 Length Required,
+    never a 303.
+    """
+    global FILE_NAME
+    try:
+        resp = requests.post(
+            f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t",
+            data="", allow_redirects=False, timeout=30)
+        if resp.status_code not in (302, 303):
+            print(f"  Signed URL: /uc answered {resp.status_code}, not a redirect")
+            return False
+
+        signed = resp.headers.get("Location", "")
+        if not signed:
+            print("  Signed URL: redirect carried no Location")
+            return False
+
+        # A 303 is not proof. Prove it serves before committing to a
+        # multi-gigabyte transfer.
+        #
+        # A Range probe is cheap and works for a FILE. It does NOT work for a
+        # folder zip: Google builds those on the fly, so there is no length to
+        # range over and the answer is 416 -- which is not a failure, just an
+        # unanswerable question. Measured on a live, freshly created folder:
+        #
+        #   Range: bytes=0-63  ->  416 Requested range not satisfiable
+        #   plain GET          ->  500 Internal Server Error  (21 bytes)
+        #
+        # So: try Range first, and on 416 fall back to a STREAMED plain GET
+        # that reads a few hundred bytes and is then closed. Never download the
+        # whole body just to identify it.
+        probe = requests.get(signed, headers={"Range": "bytes=0-63"},
+                             timeout=30, allow_redirects=True)
+        ctype = (probe.headers.get("Content-Type") or "").lower()
+
+        if probe.status_code == 416:
+            probe.close()
+            probe = requests.get(signed, timeout=30, allow_redirects=True,
+                                 stream=True)
+            ctype = (probe.headers.get("Content-Type") or "").lower()
+            head = next(probe.iter_content(512), b"")
+            probe.close()
+            if probe.status_code != 200 or "text/" in ctype or len(head) < 4:
+                print(f"  Signed URL: streamed probe returned "
+                      f"{probe.status_code} {ctype!r}, {len(head)} bytes")
+                return False
+        elif probe.status_code not in (200, 206) or "text/" in ctype:
+            print(f"  Signed URL: probe returned {probe.status_code} {ctype!r}")
+            return False
+
+        # Google states the true filename here. This is the same name the
+        # archive carries in its own root folder, and it is very often the
+        # only good name available -- the URL path has none at all.
+        real_name = ""
+        disp = probe.headers.get("Content-Disposition") or ""
+        # RFC 5987 form:  filename*=UTF-8''P661N_MT6833_GL_V124_240911.zip
+        m = _re.search(r"filename\*=UTF-8''([^;]+)", disp)
+        if m:
+            real_name = urllib.parse.unquote(m.group(1))
+        else:
+            m = _re.search(r'filename="([^"]+)"', disp)
+            if m:
+                real_name = m.group(1)
+        if real_name and not is_generic_filename(real_name):
+            if real_name != FILE_NAME:
+                print(f"  Signed URL: real filename is {real_name}")
+            FILE_NAME = real_name
+
+        print(f"  Signed URL obtained ({probe.status_code}, {ctype})")
+        return stream_download(signed, dest_path, auth=None)
+
+    except Exception as e:
+        print(f"  Signed URL error: {e}")
         return False
 
 
@@ -919,8 +1169,71 @@ def stream_download(url: str, dest_path: str, auth: str = None, params: dict = N
     return True
 
 
+def looks_like_folder_wrapper(zip_path: str) -> bool:
+    """Is this a Google folder ZIP wrapping ONE archive, or the archive itself?
+
+    Measured on four real downloads from the folder route: Google returns the
+    original file unchanged -- byte-identical to the size Drive reports for
+    the target -- named "<FolderName>-001.zip". Its entries are the firmware
+    package's own layout:
+
+        Itel_VistaTab_11_..._SPD/Credits.txt
+        Itel_VistaTab_11_..._SPD/Driver/
+        Itel_VistaTab_11_..._SPD/Firmware/<5.3 GB .pac>
+
+    Unwrapping that keeps only the .pac and discards everything else, so the
+    "-001" suffix must NOT be used as the trigger. The real question is what
+    is inside: a wrapper holds one archive and nothing that matters.
+
+    Reads the central directory only -- no extraction, so a 9 GB file costs
+    the same as a small one. Fails closed: on any error, say "not a wrapper",
+    because keeping an archive whole is recoverable and gutting one is not.
+    """
+    ARCHIVE_EXTS = (".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".pac",
+                    ".kdz", ".dz", ".ofp", ".ops", ".bin", ".img", ".md5")
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            files = [i for i in zf.infolist() if not i.is_dir()]
+    except Exception as e:
+        print(f"  Could not inspect archive ({e}); treating as not-a-wrapper")
+        return False
+
+    if not files:
+        return False
+
+    archives = [i for i in files if i.filename.lower().endswith(ARCHIVE_EXTS)]
+    if len(archives) != 1:
+        return False
+
+    # One archive inside, and it is the overwhelming majority of the content.
+    # The rest would be a stray readme or .url, never a firmware payload.
+    inner = archives[0]
+    total = sum(i.file_size for i in files) or 1
+    if inner.file_size / total < 0.95:
+        return False
+
+    # A real firmware package can also contain exactly one big .pac beside a
+    # Credits.txt -- which matches everything above. Distinguish by depth:
+    # a wrapper puts its archive at the top, a package buries it in a
+    # subfolder such as Firmware/.
+    depth = inner.filename.replace("\\", "/").strip("/").count("/")
+    return depth <= 1
+
+
 def extract_from_google_zip(zip_path: str, dest_path: str) -> bool:
-    """Extract the largest non-directory file from a Google folder ZIP."""
+    """Extract the largest non-directory file from a Google folder ZIP.
+
+    Also recovers the REAL filename. Google's folder ZIP preserves the name
+    Drive holds, which is very often the only good name in the whole pipeline
+    -- the job that produced "rom file, lexzytechinc.com.zip" is exactly the
+    case this rescues. The name used to be printed and thrown away.
+
+    Updates the FILE_NAME global rather than changing the return type, because
+    the Drive cascade in download_file() dispatches through
+    `lambda: ... -> bool` and a tuple would break every branch. This mirrors
+    what the MEGA path already does with its own recovered name.
+    """
+    global FILE_NAME
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             target = None
@@ -940,6 +1253,17 @@ def extract_from_google_zip(zip_path: str, dest_path: str) -> bool:
                 shutil.copyfileobj(src, dst)
 
             print(f"  Extracted: {target.filename} ({target_size:,} bytes)")
+
+            # Keep the real name. basename() because ZIP entries carry their
+            # folder path, and is_generic_filename() so a Drive folder that
+            # genuinely holds "download.zip" does not overwrite a better name
+            # we already had.
+            real_name = os.path.basename(target.filename)
+            if real_name and not is_generic_filename(real_name):
+                if real_name != FILE_NAME:
+                    print(f"  Recovered real filename: {real_name}")
+                FILE_NAME = real_name
+
             return True
     except Exception as e:
         print(f"  ZIP extraction error: {e}")

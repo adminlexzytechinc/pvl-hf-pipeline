@@ -1,3 +1,7 @@
 __pycache__/
 *.py[cod]
 *.class
+
+# Local scratch: scans firmware archives from a hardcoded Downloads path.
+# Useful on a dev machine, meaningless on a runner.
+scan_real_archives.py

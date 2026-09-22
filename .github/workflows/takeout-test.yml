@@ -1,0 +1,62 @@
+# One-off diagnostic: can the SERVICE ACCOUNT drive the Takeout export API?
+#
+# This answers whether the folder trick can be automated. Two of the five
+# download methods beat the per-file quota by creating a NEW object, which
+# carries its own counter:
+#
+#   GAS copy      -- blocked today: needs free Drive space, account is ~90% full
+#   Folder trick  -- blocked today: Apps Script gets 403 "insufficient scopes"
+#
+# Apps Script INFERS its scopes from its code, so it cannot ask for a scope it
+# has no API call for. A service account signs a JWT naming whatever scopes it
+# likes, so it can ask directly. If it is accepted, the folder trick becomes
+# automatable with no Apps Script, no storage and no manual click.
+#
+# Creates nothing but a temp folder and a shortcut (a pointer, 0 bytes), and
+# deletes them even on failure. Safe to run repeatedly.
+name: Takeout SA test
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_id:
+        description: 'Drive file id to test against (a quota-blocked one is ideal)'
+        required: true
+        default: '1Ng-ZZohoDMOffS6Cw1BqmwqCMLQy0BHk'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pyjwt cryptography
+
+      - name: Write SA credentials
+        env:
+          SA_JSON: ${{ secrets.SA_CREDENTIALS_JSON }}
+        run: |
+          echo "$SA_JSON" > /tmp/sa_credentials.json
+          chmod 600 /tmp/sa_credentials.json
+
+      - name: Probe Takeout with the service account
+        env:
+          SA_CREDENTIALS_PATH: /tmp/sa_credentials.json
+        run: python test_takeout_sa.py "${{ inputs.file_id }}"
+
+      # The probe exits non-zero when no scope is accepted, which is a valid
+      # answer rather than a broken run. Say so plainly in the log.
+      - name: Read the result
+        if: always()
+        run: |
+          echo "200 in the log        -> the SA can drive Takeout. Build on it."
+          echo "403 naming a scope    -> add that scope and re-run."
+          echo "403 with no scope     -> first-party only; free Drive space and"
+          echo "                         use GAS copy instead, which beats the"
+          echo "                         quota the same way (a copy is a new object)."
+          echo "401                   -> the SA identity is refused outright."

@@ -105,6 +105,48 @@ jobs:
             echo "repo_id=adminlexzytech/phone-firmware" >> "$GITHUB_OUTPUT"
           fi
 
+      # Firmware archives run to tens of gigabytes, and the worker holds the
+      # download, the full extraction and the output on disk at once. Both
+      # tempfile.mkdtemp() calls land on /tmp, which is the SMALL volume.
+      #
+      # This step reports the truth and moves the work to whichever volume is
+      # actually largest. No third-party action: everything here is a shell
+      # builtin, and nothing is removed that the build needs.
+      - name: Free disk and choose the largest volume
+        run: |
+          echo "=== before ==="
+          df -h / /mnt 2>/dev/null || df -h /
+
+          # Reclaim space the build never uses. Each is a preinstalled toolchain
+          # that this workflow does not touch; failures are ignored on purpose
+          # because the runner image changes and a missing path is not an error.
+          sudo rm -rf /usr/share/dotnet                  || true
+          sudo rm -rf /usr/local/lib/android             || true
+          sudo rm -rf /opt/ghc                           || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL        || true
+          sudo rm -rf /usr/local/share/boost             || true
+          sudo rm -rf /usr/local/share/powershell        || true
+          sudo docker image prune --all --force          || true
+
+          echo "=== after ==="
+          df -h / /mnt 2>/dev/null || df -h /
+
+          # Put temporary work on the biggest writable volume. /mnt is a
+          # separate, larger disk on GitHub-hosted runners, but do not assume
+          # it exists -- fall back to /tmp and say which was chosen.
+          WORKDIR=/tmp
+          if [ -d /mnt ] && sudo mkdir -p /mnt/pvl-tmp 2>/dev/null; then
+            sudo chmod 777 /mnt/pvl-tmp
+            AVAIL_MNT=$(df -Pk /mnt | awk 'NR==2 {print $4}')
+            AVAIL_TMP=$(df -Pk /tmp | awk 'NR==2 {print $4}')
+            if [ "${AVAIL_MNT:-0}" -gt "${AVAIL_TMP:-0}" ]; then
+              WORKDIR=/mnt/pvl-tmp
+            fi
+          fi
+          echo "TMPDIR=$WORKDIR" >> "$GITHUB_ENV"
+          echo "Temporary work will use: $WORKDIR"
+          df -h "$WORKDIR"
+
       - name: Run build worker
         env:
           SA_CREDENTIALS_PATH: /tmp/sa_credentials.json
@@ -127,6 +169,12 @@ jobs:
           DEDUP_API_URL: ${{ secrets.DEDUP_API_URL }}
           DEDUP_API_TOKEN: ${{ secrets.DEDUP_API_TOKEN }}
         run: python hf_build_worker.py
+
+      - name: Report disk on failure
+        if: failure()
+        run: |
+          echo "Build failed. Disk at time of failure:"
+          df -h / /mnt "${TMPDIR:-/tmp}" 2>/dev/null || df -h /
 
       - name: Cleanup credentials
         if: always()
