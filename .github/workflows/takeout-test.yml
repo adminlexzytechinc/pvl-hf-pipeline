@@ -1,28 +1,37 @@
-# One-off diagnostic: can the SERVICE ACCOUNT drive the Takeout export API?
+# Read-only diagnostics against Google Drive. Neither probe downloads a file.
 #
-# This answers whether the folder trick can be automated. Two of the five
-# download methods beat the per-file quota by creating a NEW object, which
-# carries its own counter:
+#   quota    Is the download quota counted per FILE or per REQUESTER?
+#            This decides whether adding accounts helps at all. If the quota
+#            is per-file and global, every identity meets the same wall and
+#            more accounts only help by providing STORAGE for a copy. If it
+#            has a per-requester component, a file can be pulled in slices by
+#            several identities and reassembled. Reads a few KB.
 #
-#   GAS copy      -- blocked today: needs free Drive space, account is ~90% full
-#   Folder trick  -- blocked today: Apps Script gets 403 "insufficient scopes"
+#   takeout  Can a service account drive the Takeout export API, which is what
+#            Drive's own Download button uses for a folder?
+#            ANSWERED: no. Every scope returns 403 naming
+#            google.internal.takeout.v1.TakeoutService.CreateExport -- an
+#            internal service with no public scope. Kept for reproducibility.
+#            Creates only a folder and a shortcut (a pointer, 0 bytes) and
+#            deletes them even on failure.
 #
-# Apps Script INFERS its scopes from its code, so it cannot ask for a scope it
-# has no API call for. A service account signs a JWT naming whatever scopes it
-# likes, so it can ask directly. If it is accepted, the folder trick becomes
-# automatable with no Apps Script, no storage and no manual click.
-#
-# Creates nothing but a temp folder and a shortcut (a pointer, 0 bytes), and
-# deletes them even on failure. Safe to run repeatedly.
-name: Takeout SA test
+# Both are safe to run repeatedly. Point them at a file you KNOW is blocked --
+# that is the only case where either answer matters.
+name: Drive diagnostics
 
 on:
   workflow_dispatch:
     inputs:
       file_id:
-        description: 'Drive file id to test against (a quota-blocked one is ideal)'
+        description: 'Drive file id to test against (a quota-BLOCKED one is ideal)'
         required: true
         default: '1Ng-ZZohoDMOffS6Cw1BqmwqCMLQy0BHk'
+      probe:
+        description: 'Which diagnostic to run'
+        required: true
+        default: 'quota'
+        type: choice
+        options: [quota, takeout, both]
 
 jobs:
   probe:
@@ -44,7 +53,14 @@ jobs:
           echo "$SA_JSON" > /tmp/sa_credentials.json
           chmod 600 /tmp/sa_credentials.json
 
-      - name: Probe Takeout with the service account
+      - name: Is the quota per-file or per-requester?
+        if: ${{ inputs.probe == 'quota' || inputs.probe == 'both' }}
+        env:
+          SA_CREDENTIALS_PATH: /tmp/sa_credentials.json
+        run: python test_quota_model.py "${{ inputs.file_id }}"
+
+      - name: Can the service account drive Takeout?
+        if: ${{ inputs.probe == 'takeout' || inputs.probe == 'both' }}
         env:
           SA_CREDENTIALS_PATH: /tmp/sa_credentials.json
         run: python test_takeout_sa.py "${{ inputs.file_id }}"
