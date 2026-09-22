@@ -1,0 +1,46 @@
+# Measure ranged Drive downloads from a GitHub runner.
+#
+# WHY THIS RUNS HERE AND NOT ON A LAPTOP
+# Every earlier measurement came from one home connection that Google had
+# already watched pull the same files for an hour, and those measurements
+# contradicted each other -- 4 workers beat 1 worker 3.5x in one trial and
+# lost to it in the next. A runner has a different IP, a different link and
+# no history with these files, which is the point.
+#
+# It answers three things a laptop cannot:
+#   - is a datacenter IP throttled MORE than a home one, or less?
+#   - what is the real throughput when the link is not the bottleneck?
+#   - does a blocked file finish reliably, or fail partway as it did locally?
+#
+# Read-only against Drive. Moves well under a gigabyte, writes nothing
+# outside the workspace, and touches no secrets.
+name: Ranged download benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_ids:
+        description: 'Drive file ids, space separated (mix a blocked one with a working one)'
+        required: true
+        default: '1WwUqFJ2qeSVZOZzYuvlFlLMxyTagcb5c 14-f-XF_TuGT41rvMz3jFEPcNOxU_lEpD'
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install requests
+
+      - name: Where this runner sits
+        run: |
+          echo "runner egress IP: $(curl -s --max-time 10 https://api.ipify.org || echo unknown)"
+          df -h / | tail -1
+
+      - name: Benchmark
+        run: python -u bench_ranged.py ${{ inputs.file_ids }}
