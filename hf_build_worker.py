@@ -855,6 +855,13 @@ def gas_poll_takeout(job_id: str, budget_s: int = 900) -> dict:
 
 def gas_try_folder_download(file_id: str, dest_path: str) -> bool:
     """GAS Approach B: Folder + shortcut + signed URL."""
+    # Required, not stylistic: this function ASSIGNS FILE_NAME when the bridge
+    # reports the real name, and in Python a single assignment anywhere in a
+    # function makes the name local for the WHOLE function. Without this, the
+    # read in the request below raised UnboundLocalError before any network
+    # call, so the folder route failed on every build from 6402327 onward.
+    # test_worker_globals.py pins it.
+    global FILE_NAME
     try:
         resp = requests.get(GAS_BRIDGE_URL, params={
             "action":   "folder_download",
