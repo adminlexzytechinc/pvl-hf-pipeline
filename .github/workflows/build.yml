@@ -168,7 +168,11 @@ jobs:
           SERVE_TIME_BRANDING: ${{ inputs.serve_time_branding }}
           DEDUP_API_URL: ${{ secrets.DEDUP_API_URL }}
           DEDUP_API_TOKEN: ${{ secrets.DEDUP_API_TOKEN }}
-        run: python hf_build_worker.py
+        # -u is load-bearing. Without it Python buffers stdout, and a build
+        # killed by timeout-minutes loses everything it printed: run
+        # 35868500541 ran the full 60 minutes on a MEGA file and its log
+        # ends at the env block, with not even the worker's banner.
+        run: python -u hf_build_worker.py
 
       - name: Report disk on failure
         if: failure()
