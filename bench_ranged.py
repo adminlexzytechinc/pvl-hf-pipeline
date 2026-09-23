@@ -154,7 +154,12 @@ def main():
         print("\n  throughput (32 MiB per trial, fresh region each time)")
         best = None
         for i, w in enumerate((1, 2, 4)):
-            base = (1 + i) * 1_000_000_000
+            # Spread the trials across the file rather than at fixed gigabyte
+            # marks: a 2.9 GB file has no window at 3 GB, and the old offsets
+            # reported that as "FAIL ... empty window" -- a benchmark bug that
+            # read like a download failure.
+            span = max(info["size"] - WINDOW, 0)
+            base = (span * (i + 1)) // 4
             dest, b, rate = trial(url, info["size"], w, base, file_id[:6])
             if dest and (best is None or rate > best[2]):
                 if best:
