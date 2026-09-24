@@ -23,6 +23,7 @@ import os
 import sys
 import json
 import time
+import threading
 import shutil
 import hashlib
 import zipfile
@@ -344,6 +345,18 @@ def clean_watermarks(filename: str) -> str:
 _last_progress_time = 0
 # The last thing reported, re-sent by the heartbeat (added 2026-09-24).
 _progress_state = {"stage": "queued", "percent": 0, "message": "Build started"}
+# Set once a final report (complete / error / duplicate) is sent. The
+# heartbeat checks it under the same lock, so it can never send a progress
+# report AFTER the final one -- WordPress would read that as "still
+# building" and later mark a finished file as failed (fixed 2026-09-24).
+_final_lock = threading.Lock()
+_final_sent = False
+
+
+def _mark_final():
+    global _final_sent
+    with _final_lock:
+        _final_sent = True
 
 def report_progress(stage: str, percent: int, message: str = "", force: bool = False):
     """Post a progress update to WordPress. Throttled to every 15 seconds unless forced."""
@@ -381,29 +394,31 @@ def start_heartbeat():
     healthy but quiet build must still say it is alive. Runs in the
     background and stops with the process.
     """
-    import threading
-
     def beat():
         while True:
             time.sleep(HEARTBEAT_SECONDS)
-            s = dict(_progress_state)
-            try:
-                requests.post(CALLBACK_URL, json={
-                    "build_id": BUILD_ID,
-                    "file_id":  FILE_ID,
-                    "secret":   CALLBACK_SECRET,
-                    "stage":    s["stage"],
-                    "percent":  min(int(s["percent"]), 100),
-                    "message":  s["message"],
-                }, timeout=10)
-            except Exception:
-                pass
+            with _final_lock:
+                if _final_sent:
+                    return
+                s = dict(_progress_state)
+                try:
+                    requests.post(CALLBACK_URL, json={
+                        "build_id": BUILD_ID,
+                        "file_id":  FILE_ID,
+                        "secret":   CALLBACK_SECRET,
+                        "stage":    s["stage"],
+                        "percent":  min(int(s["percent"]), 100),
+                        "message":  s["message"],
+                    }, timeout=10)
+                except Exception:
+                    pass
 
     threading.Thread(target=beat, daemon=True).start()
 
 
 def report_error(message: str):
     """Report a fatal error to WordPress."""
+    _mark_final()
     print(f"[ERROR] {message}")
     try:
         requests.post(CALLBACK_URL, json={
@@ -425,6 +440,7 @@ def report_duplicate(existing_file_id: str, reason: str = ""):
     caller needs to distinguish "we already have this" from "the build failed"
     to avoid queueing a pointless retry.
     """
+    _mark_final()
     print(f"[100%] Duplicate: already indexed as {existing_file_id} ({reason})")
     try:
         requests.post(CALLBACK_URL, json={
@@ -449,6 +465,7 @@ def report_complete(hf_url: str, file_size: int, hf_url_clean: str = "", file_si
     on the same payload, so a non-dual-build run (or a WordPress side that
     hasn't been updated to read them yet) is unaffected.
     """
+    _mark_final()
     print(f"[100%] Complete: Upload verified ({file_size} bytes)")
     if hf_url_clean:
         print(f"[100%] Clean variant verified ({file_size_clean} bytes)")
