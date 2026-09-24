@@ -218,7 +218,7 @@ def naming_meta(context_meta, facts, expected_model=''):
     if proved:
         want = (meta.get('model') or {}).get('value') or expected_model or ''
         norm = lambda s: re.sub(r'[^A-Z0-9]', '', str(s).upper())
-        if not want or norm(want).endswith(norm(proved)):
+        if not want or norm(want).endswith(norm(proved)) or same_model(want, proved):
             # Use the post's spelling when it matches (SM-S741N, not S741N).
             meta['model'] = {'value': want or proved, 'source': 'payload'}
         else:
@@ -242,6 +242,28 @@ def naming_meta(context_meta, facts, expected_model=''):
     if tag:
         meta['platform'] = {'value': tag, 'source': 'payload'}
     return meta
+
+
+# Transsion preloaders carry the internal PROJECT name, which is the model
+# code plus a variant suffix: preloader_kl4ha32_<board>.bin for the KL4h
+# (found on the first live build, 2026-09-24). The suffix is a letter and
+# digits. A lone trailing letter is NOT a suffix: LC7 and LC7S are different
+# phones.
+_PROJECT_SUFFIX = re.compile(r'^[A-Z]\d{1,3}$')
+
+
+def same_model(a, b):
+    """True when a and b name the same phone: equal once punctuation is
+    ignored, or one is the other plus a project suffix (KL4H / KL4HA32)."""
+    na = re.sub(r'[^A-Z0-9]', '', str(a or '').upper())
+    nb = re.sub(r'[^A-Z0-9]', '', str(b or '').upper())
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    short, long_ = (na, nb) if len(na) < len(nb) else (nb, na)
+    return (len(short) >= 3 and re.search(r'\d', short) is not None
+            and long_.startswith(short) and bool(_PROJECT_SUFFIX.match(long_[len(short):])))
 
 
 # --- the stored name, end to end (ADDED 2026-09-24) ---------------------------
@@ -357,6 +379,14 @@ def stored_base_name(vendor, device_info, facts):
     """
     meta = naming_meta(device_info, facts)
     note = meta.pop('_contradiction', '')
+    if vendor and (meta.get('model') or {}).get('value'):
+        # The vendor's name may already carry the model under its short
+        # spelling ("KL4h-XE679C-..." for project KL4HA32). Use that spelling,
+        # so the model counts as present instead of being added in front.
+        for tok in re.split(r'[^A-Za-z0-9]+', vendor):
+            if tok and same_model(tok, meta['model']['value']):
+                meta['model'] = dict(meta['model'], value=tok)
+                break
     if vendor:
         out = canonical_name(vendor, meta)
     else:

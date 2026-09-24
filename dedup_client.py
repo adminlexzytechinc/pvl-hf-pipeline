@@ -25,8 +25,8 @@ import os
 import urllib.error
 import urllib.request
 
-DEDUP_API_URL = os.environ.get("DEDUP_API_URL", "").rstrip("/")
-DEDUP_API_TOKEN = os.environ.get("DEDUP_API_TOKEN", "")
+DEDUP_API_URL = os.environ.get("DEDUP_API_URL", "").strip().rstrip("/")
+DEDUP_API_TOKEN = os.environ.get("DEDUP_API_TOKEN", "").strip()  # a pasted secret can carry a stray newline
 TIMEOUT = 15
 
 # 8 MB reads: large enough that hashing a 4.5 GB file is I/O bound rather than

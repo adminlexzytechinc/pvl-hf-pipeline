@@ -124,6 +124,21 @@ ok(got == "P661N_MT6833_GL_V124_240911" and "or" not in got.split("_"),
 got, _ = name("rom file", "rom file", {}, ROM)
 ok(got.startswith("Infinix_X6856"), "a single-brand guess (Infinix, from an X#### code) is still used", got)
 
+print("\n== Transsion project names are the same phone (first live build, 2026-09-24) ==")
+KL4 = ["KL4h-XE679C-UGo-IN-241021V1772/MT6765_Android_scatter.txt",
+       "KL4h-XE679C-UGo-IN-241021V1772/preloader_kl4ha32_h6127.bin"]
+got, _ = name("KL4h-XE679C-UGo-IN-241021V1772 Factory Signed Firmware", "", {}, KL4)
+ok(got == "KL4h-XE679C-UGo-IN-241021V1772 Factory Signed Firmware_MT6765",
+   "project KL4HA32 in a KL4h name -> nothing added in front (was: KL4HA32_KL4h-...)", got)
+facts = pr.read_payload(KL4)
+_, dec = nc.stored_base_name("KL4h-XE679C-UGo-IN-241021V1772", nc.parse_device_info('{"brand":"Tecno","series":"Spark 30C","model":"KL4h"}'), facts)
+ok("contradiction" not in dec, "a post saying KL4h is NOT flagged as a different phone", dec.get("contradiction"))
+ok(nc.same_model("KL4h", "KL4HA32") and nc.same_model("LB7", "LB7") and not nc.same_model("LC7", "LC7S")
+   and not nc.same_model("X6896", "X6856") and not nc.same_model("X68", "X6856"),
+   "same phone: KL4h/KL4HA32; different: LC7/LC7S, X6896/X6856")
+_, dec = nc.stored_base_name("", nc.parse_device_info('{"model":"X6896"}'), pr.read_payload(ROM))
+ok("contradiction" in dec, "the real wrong-phone case (X6856 on the X6896 post) is still caught")
+
 print("\n== Bad input never breaks a build ==")
 for raw in ("", "not json", "[1,2]", '{"brand": null, "model": "N/A"}'):
     ok(nc.parse_device_info(raw) == {}, "device_info %r -> ignored" % raw)
