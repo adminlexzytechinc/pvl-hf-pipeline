@@ -43,6 +43,10 @@ on:
         description: 'Store one brand-neutral archive; the Worker appends branding per request (true/false). Overrides dual_build.'
         required: false
         default: 'false'
+      device_info:
+        description: 'JSON {brand, series, model} from the file registry, used to name the stored file'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -169,6 +173,7 @@ jobs:
           SOURCE_URL: ${{ inputs.source_url }}
           DUAL_BUILD: ${{ inputs.dual_build }}
           SERVE_TIME_BRANDING: ${{ inputs.serve_time_branding }}
+          DEVICE_INFO: ${{ inputs.device_info }}
           DEDUP_API_URL: ${{ secrets.DEDUP_API_URL }}
           DEDUP_API_TOKEN: ${{ secrets.DEDUP_API_TOKEN }}
         # -u is load-bearing. Without it Python buffers stdout, and a build

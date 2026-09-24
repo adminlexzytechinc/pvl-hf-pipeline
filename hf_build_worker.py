@@ -42,6 +42,9 @@ from mega_url import is_mega_url
 from mega_download import mega_download
 from source_labels import source_label
 import dedup_client
+import name_composer
+import payload_reader
+import zip_passthrough
 
 # ─────────────────────────────────────────────
 #  Configuration
@@ -60,6 +63,9 @@ BUILD_ID            = os.environ.get("BUILD_ID", "")
 EXCLUDE_PATTERNS    = [p.strip() for p in os.environ.get("EXCLUDE_PATTERNS", "").split("\n") if p.strip()]
 SOURCE_TYPE         = os.environ.get("SOURCE_TYPE", "gdrive").strip().lower()
 SOURCE_URL          = os.environ.get("SOURCE_URL", "").strip()
+# ADDED 2026-09-24: brand/series/model the file registry holds for this file,
+# as JSON. Empty for bulk-queue links and for WordPress sites not yet updated.
+DEVICE_INFO         = os.environ.get("DEVICE_INFO", "").strip()
 DUAL_BUILD          = os.environ.get("DUAL_BUILD", "false").strip().lower() in ("true", "1", "yes")
 # Serve-time branding: store ONE brand-neutral artifact and let the Cloudflare
 # Worker append the branding per request. When this is on, the build produces no
@@ -261,6 +267,9 @@ def strip_site_watermarks(filename: str) -> str:
     # the long/medium dashes of this site's own older branding
     # ("..._190417 — lexzytechinc.com.zip") were left behind as "..._190417 —".
     filename = filename.strip(' \t_-([–—')
+    # ADDED 2026-09-24 (same rule in pvl-match.php): MobiFirmware's "+" between
+    # a dated build number and its watermark goes with the watermark.
+    filename = _re.sub(r'(\d{6}V\d+|V\d+_\d{6})\+(?=$|\()', r'\1', filename, flags=_re.I)
 
     return filename + ext
 
@@ -431,7 +440,8 @@ def report_duplicate(existing_file_id: str, reason: str = ""):
         pass
 
 
-def report_complete(hf_url: str, file_size: int, hf_url_clean: str = "", file_size_clean: int = 0):
+def report_complete(hf_url: str, file_size: int, hf_url_clean: str = "", file_size_clean: int = 0,
+                    key_name: str = None):
     """Report successful completion to WordPress.
 
     hf_url_clean / file_size_clean are only sent when a DUAL_BUILD run
@@ -456,6 +466,13 @@ def report_complete(hf_url: str, file_size: int, hf_url_clean: str = "", file_si
         if hf_url_clean:
             payload["hf_url_clean"]  = hf_url_clean
             payload["hf_size_clean"] = file_size_clean
+        if key_name is not None:
+            # ADDED 2026-09-24. The stored name now carries added detail
+            # (brand, series, chipset). Duplicate detection must keep reading
+            # the vendor's own name: "Tecno_Phantom_X2_(AD8-...)" and
+            # "AD8-..." are one build, but "x2" would split their keys.
+            # Empty means the file's name carries no identity at all.
+            payload["key_name"] = key_name
         requests.post(CALLBACK_URL, json=payload, timeout=10)
     except Exception:
         pass
@@ -1686,6 +1703,30 @@ def process_archive(source_path: str, output_path: str, original_name: str,
             SERVE_TIME_BRANDING, where the Worker appends them per request and
             the stored payload must stay brand-neutral.
     """
+    # ADDED 2026-09-24: a ZIP is repacked by copying its compressed bytes
+    # (zip_passthrough.py) -- no 25% growth, no extraction, seconds not
+    # minutes. Same files in the same places; anything it has not been proven
+    # on falls through to the extract-and-store path below, unchanged.
+    if not clean_output_path and zipfile.is_zipfile(source_path):
+        report_progress("processing", 81, "Checking archive contents...", force=True)
+        locked = find_password_locked_in_zip(source_path)
+        if locked:
+            raise RuntimeError(locked)
+        extra = None
+        if add_branding:
+            extra = {"README - Download Info.txt": WATERMARK_README.encode("utf-8"),
+                     f"Downloaded from {BRAND_NAME}.txt": WATERMARK_BRAND.encode("utf-8"),
+                     f"{BRAND_NAME}.url": WATERMARK_URL.encode("utf-8")}
+        try:
+            report_progress("processing", 83, "Repacking without recompressing...", force=True)
+            stats = zip_passthrough.passthrough_repack(source_path, output_path, EXCLUDE_PATTERNS,
+                                                       root_folder=root_folder, extra_files=extra)
+            print(f"  Direct copy: {stats['kept']} files kept, {stats['excluded']} excluded, "
+                  f"{stats['total_size'] // (1024*1024)} MB")
+            return stats
+        except zip_passthrough.Decline as e:
+            print(f"  Direct copy not used ({e}); extracting instead")
+
     report_progress("processing", 81, "Extracting archive contents...", force=True)
     staging_dir = tempfile.mkdtemp(prefix="pvl_stage_")
 
@@ -1753,6 +1794,70 @@ def process_archive(source_path: str, output_path: str, original_name: str,
 
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def find_password_locked_in_zip(zip_path: str) -> str:
+    """find_password_locked(), for the passthrough: the same verdict, read
+    from the central directory, extracting only the archives inside."""
+    total_bytes = locked_bytes = 0
+    worst = ""
+    with zipfile.ZipFile(zip_path) as zf:
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        total_bytes = sum(i.file_size for i in infos)
+        for info in infos:
+            leaf = info.filename.replace("\\", "/").rsplit("/", 1)[-1]
+            if not leaf.lower().endswith(NESTED_ARCHIVE_EXTS):
+                continue
+            tmp = tempfile.mkdtemp(prefix="pvl_nested_")
+            try:
+                path = os.path.join(tmp, "inner" + os.path.splitext(leaf)[1].lower())
+                with zf.open(info) as src, open(path, "wb") as dst:
+                    shutil.copyfileobj(src, dst, 16 * 1024 * 1024)
+                inner_locked, inner_total = _archive_lock_state(path)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            if inner_total and inner_locked / inner_total > LOCKED_SHARE_LIMIT:
+                locked_bytes += info.file_size
+                if not worst:
+                    worst = leaf
+    if total_bytes and locked_bytes / total_bytes > LOCKED_SHARE_LIMIT:
+        return ("Firmware is password-protected (%s): %d%% of the package is locked "
+                "and cannot be flashed, so it was not uploaded."
+                % (worst, round(100 * locked_bytes / total_bytes)))
+    return ""
+
+
+def archive_entries(path: str) -> list:
+    """The archive's file list as [{'name', 'size'}], or [] if it cannot be read.
+    A zip is read from its central directory; anything else through 7z."""
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as zf:
+                return [{"name": i.filename, "size": i.file_size}
+                        for i in zf.infolist() if not i.is_dir()]
+        res = subprocess.run(["7z", "l", "-slt", "-p", path], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=300)
+        out = res.stdout.decode("utf-8", errors="replace")
+        cur, entries, started = {}, [], False
+        for line in out.splitlines() + [""]:
+            if line.startswith("----------"):
+                started = True
+                continue
+            if not started:
+                continue
+            if line.startswith("Path = "):
+                cur = {"name": line[7:]}
+            elif line.startswith("Size = ") and cur:
+                cur["size"] = int(line[7:].strip() or 0)
+            elif line.startswith("Folder = +"):
+                cur = {}
+            elif not line.strip() and cur.get("name"):
+                entries.append(cur)
+                cur = {}
+        return entries
+    except Exception as e:
+        print(f"  Could not list the archive ({e})")
+        return []
 
 
 def package_standalone_file(raw_path: str, output_path: str, original_name: str,
@@ -1946,6 +2051,34 @@ def main():
         # Strip existing branding if present
         for strip in [" - lexzytechinc.com", " — lexzytechinc.com", "- lexzytechinc.com", "— lexzytechinc.com", "lexzytechinc.com"]:
             base_name = base_name.replace(strip, "").strip()
+        # ADDED 2026-09-24: the name from NAMING-PLAN.md -- the vendor's own
+        # string, unchanged, with brand/series/model in front and the chipset
+        # behind, each only when missing and only from a trusted source (the
+        # archive itself counts highest). Identity keys stay on the vendor
+        # string (key_name), so the added detail never splits a duplicate.
+        facts = None
+        if is_extractable_archive(raw_path, original_name):
+            entries = archive_entries(raw_path)
+            if entries:
+                try:
+                    facts = payload_reader.read_payload(entries)
+                except Exception as e:
+                    print(f"  Payload read failed (non-fatal): {e}")
+        root_base = ""
+        if facts and facts.get("archive_root_name"):
+            root_base = os.path.splitext(clean_watermarks(facts["archive_root_name"] + ".zip"))[0]
+        samsung_code = ""
+        if facts and facts.get("container") == "samsung_odin":
+            samsung_code = name_composer.samsung_build_code([e["name"] for e in entries])
+        vendor = name_composer.vendor_base("" if is_generic_filename(base_name) else base_name, root_base,
+                                           samsung_code)
+        key_name = f"{vendor}.zip" if vendor else ""
+        composed, decisions = name_composer.stored_base_name(
+            vendor, name_composer.parse_device_info(DEVICE_INFO), facts)
+        for field, d in decisions.items():
+            if d.get("status") != "omitted":
+                print(f"  Name {field}: {d['status']} ({d['why']})")
+        base_name = composed or vendor or base_name
         if is_generic_filename(base_name):
             base_name = FILE_ID
         branded_name = f"{base_name} - {BRAND_NAME}.zip"
@@ -2028,7 +2161,7 @@ def main():
             dedup_client.record_unchecked(FILE_ID, source_sha, verdict.get("reason", ""))
 
         # ─── Step 6: Report completion ───
-        report_complete(hf_url, processed_size, hf_url_clean, clean_size)
+        report_complete(hf_url, processed_size, hf_url_clean, clean_size, key_name=key_name)
 
         print("\n" + "=" * 60)
         print("BUILD SUCCESSFUL")
