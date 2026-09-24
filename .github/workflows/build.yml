@@ -47,7 +47,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Raised from 60 on 2026-09-24: a quota-blocked file fetched in slices can
+    # take hours. GitHub stops any job at 360; WordPress treats a build as dead
+    # at 370 (pvl_hf_clean_stale_builds), so the two cannot disagree.
+    timeout-minutes: 350
 
     steps:
       - name: Checkout repository

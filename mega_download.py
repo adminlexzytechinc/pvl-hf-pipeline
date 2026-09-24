@@ -19,6 +19,11 @@ import time
 
 from mega_url import is_mega_url, parse_mega_url
 
+# Transfer ceilings (same values as before; module-level so a test can shorten
+# them). MAX_IDLE is the one that matters: see the watchdog in mega_download().
+MAX_RUNTIME_SECONDS = 3600 * 5
+MAX_IDLE_SECONDS = 600
+
 MEGA_BIN = shutil.which("megatools")
 
 
@@ -69,8 +74,8 @@ def mega_download(file_id: str, source_url: str, dest_path: str, progress_callba
     # Hard ceilings for the transfer. MAX_RUNTIME caps the whole download;
     # MAX_IDLE kills a transfer that has gone silent (dead socket, throttled
     # to zero) instead of letting it hold the runner until GitHub's own limit.
-    MAX_RUNTIME = 3600 * 5
-    MAX_IDLE = 600
+    MAX_RUNTIME = MAX_RUNTIME_SECONDS
+    MAX_IDLE = MAX_IDLE_SECONDS
 
     proc = None
     try:
@@ -113,6 +118,35 @@ def mega_download(file_id: str, source_url: str, dest_path: str, progress_callba
         buf = []
         timed_out_reason = None
 
+        # FIXED 2026-09-24: MAX_IDLE was defined above and never enforced.
+        # The loop below blocks inside proc.stderr.read(); when megatools goes
+        # silent (dead socket, MEGA making it wait) that read never returns,
+        # so neither limit is ever checked and the build sits until GitHub
+        # kills the whole job -- run 35868500541 did exactly that, for the
+        # full 60 minutes, every 6 hours. A watchdog checks from outside the
+        # blocking read and stops megatools, which closes stderr and lets the
+        # loop end normally.
+        watch = {"last": started, "reason": None}
+
+        def _watchdog():
+            import threading  # noqa: F401  (documented: runs on its own thread)
+            while proc.poll() is None:
+                time.sleep(5)
+                now_w = time.time()
+                if now_w - watch["last"] > MAX_IDLE:
+                    watch["reason"] = f"no progress for {MAX_IDLE // 60} minutes (stalled)"
+                elif now_w - started > MAX_RUNTIME:
+                    watch["reason"] = f"exceeded {MAX_RUNTIME // 3600}h runtime limit"
+                if watch["reason"]:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return
+
+        import threading
+        threading.Thread(target=_watchdog, daemon=True).start()
+
         # Read in chunks rather than a character at a time: an 8GB transfer
         # emits a great many progress updates and read(1) per character is
         # one syscall each for no benefit. Progress lines are \r-terminated,
@@ -124,6 +158,7 @@ def mega_download(file_id: str, source_url: str, dest_path: str, progress_callba
 
             now = time.time()
             last_output_time = now
+            watch["last"] = now
             if now - started > MAX_RUNTIME:
                 timed_out_reason = f"exceeded {MAX_RUNTIME // 3600}h runtime limit"
                 break
@@ -153,6 +188,10 @@ def mega_download(file_id: str, source_url: str, dest_path: str, progress_callba
                                 pass
                 else:
                     buf.append(char)
+
+        # The watchdog stopped megatools: report it as the timeout it is.
+        if not timed_out_reason and watch["reason"]:
+            timed_out_reason = watch["reason"]
 
         if timed_out_reason:
             proc.kill()

@@ -86,7 +86,8 @@ def trial(url, size, workers, base, tag):
     t0 = time.time()
     try:
         f = RangedFetcher(url, dest, size=size, workers=workers, chunk=CHUNK,
-                          tries=10, start=base, end=base + WINDOW - 1)
+                          tries=10, rounds=1, adaptive=False,
+                          start=base, end=base + WINDOW - 1)
         got, secs, reqs = f.run()
         n_chunks = WINDOW // CHUNK
         print("    %d worker(s): OK    %6.1fs  %5.2f MB/s  "

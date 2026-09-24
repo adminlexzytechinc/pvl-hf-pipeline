@@ -329,10 +329,13 @@ def clean_watermarks(filename: str) -> str:
 # ─────────────────────────────────────────────
 
 _last_progress_time = 0
+# The last thing reported, re-sent by the heartbeat (added 2026-09-24).
+_progress_state = {"stage": "queued", "percent": 0, "message": "Build started"}
 
 def report_progress(stage: str, percent: int, message: str = "", force: bool = False):
     """Post a progress update to WordPress. Throttled to every 15 seconds unless forced."""
     global _last_progress_time
+    _progress_state.update(stage=stage, percent=percent, message=message)
     now = time.time()
     if not force and (now - _last_progress_time) < 15:
         return
@@ -351,6 +354,39 @@ def report_progress(stage: str, percent: int, message: str = "", force: bool = F
         }, timeout=10)
     except Exception as e:
         print(f"  Warning: progress callback failed: {e}")
+
+
+HEARTBEAT_SECONDS = 240
+
+
+def start_heartbeat():
+    """Re-send the current progress every 4 minutes (added 2026-09-24).
+
+    Some steps are silent for a long time -- extracting a 20 GB archive, a
+    slow ranged download of a throttled file. WordPress treats a build that
+    has reported nothing for 20 minutes as dead and starts it again, so a
+    healthy but quiet build must still say it is alive. Runs in the
+    background and stops with the process.
+    """
+    import threading
+
+    def beat():
+        while True:
+            time.sleep(HEARTBEAT_SECONDS)
+            s = dict(_progress_state)
+            try:
+                requests.post(CALLBACK_URL, json={
+                    "build_id": BUILD_ID,
+                    "file_id":  FILE_ID,
+                    "secret":   CALLBACK_SECRET,
+                    "stage":    s["stage"],
+                    "percent":  min(int(s["percent"]), 100),
+                    "message":  s["message"],
+                }, timeout=10)
+            except Exception:
+                pass
+
+    threading.Thread(target=beat, daemon=True).start()
 
 
 def report_error(message: str):
@@ -608,6 +644,9 @@ def download_file(file_id: str, dest_path: str) -> bool:
         # Free, no storage, no temp folder, no bridge -- and it works on files
         # the public-link route reports as quota-blocked. Try it first.
         ("Signed URL", 4, lambda: signed_url_download(file_id, dest_path)),
+        # Added 2026-09-24. Right after Signed URL: when the whole-file request
+        # is refused as over quota, the same file in slices usually is not.
+        ("Ranged download", 5, lambda: ranged_download(file_id, dest_path)),
         ("GAS copy", 5, lambda: gas_try_copy(file_id, dest_path)),
         ("GAS folder download", 10, lambda: gas_try_folder_download(file_id, dest_path)),
         ("Web download URL", 15, lambda: web_download(file_id, dest_path)),
@@ -907,6 +946,19 @@ def gas_try_folder_download(file_id: str, dest_path: str) -> bool:
         signed_url = data["signedUrl"]
         via = data.get("via", "folder")
 
+        # FIXED 2026-09-24. via == "file" is the bridge running the SAME
+        # POST /uc on the SAME file id that "Signed URL" already tried at the
+        # top of the cascade. It returns only because the bridge checks it
+        # with a small ranged request, which a quota-blocked file answers;
+        # the whole-file download below then gets 429, and the retry loop
+        # spent about 8 minutes of runner time on every blocked build before
+        # giving up. (The v5 bridge never returned this at all: its bodyless
+        # POST always failed at once, so the cascade moved on immediately.)
+        if via == "file":
+            print("  GAS folder: bridge returned the same file link Signed URL "
+                  "already tried; moving on")
+            return False
+
         # A Takeout archive URL is SESSION BOUND. Fetched with no credentials
         # it answers 302 -> accounts.google.com/ServiceLogin, even seconds
         # after the job reports SUCCEEDED -- measured on a fresh job. So it
@@ -1080,6 +1132,69 @@ def signed_url_download(file_id: str, dest_path: str) -> bool:
     except Exception as e:
         print(f"  Signed URL error: {e}")
         return False
+
+
+# How long the ranged route may keep asking before the cascade moves on. The
+# job itself is allowed 350 minutes (build.yml); this leaves room for the
+# repack and the Hugging Face upload of a large file.
+RANGED_DEADLINE_SECONDS = 270 * 60
+
+
+def ranged_download(file_id: str, dest_path: str) -> bool:
+    """Approach 0b: fetch the file in byte ranges (added 2026-09-24).
+
+    WHY: Drive's "quota exceeded" answer is given to a request for the WHOLE
+    file. The same file, asked for in slices, is still served -- measured on
+    GitHub runners 9 times out of 9, across 3 files and 4 addresses, with every
+    re-checked sample byte-identical. Signed URL (the step before this) asks
+    for the whole file, which is why it gets 429 on a blocked file.
+
+    The fetch is written into its OWN file and renamed into place only when
+    complete, so a partial result can never be mistaken for a download by the
+    rest of the cascade, and no leftover can be mistaken for a finished one.
+    """
+    global FILE_NAME
+    from ranged_fetch import RangedFetcher, RangedFetchError, drive_url, probe
+
+    url = drive_url(file_id)
+    try:
+        size, served_name = probe(url)
+    except Exception as e:
+        print(f"  Ranged download: not available ({e})")
+        return False
+
+    if served_name and not is_generic_filename(served_name):
+        if served_name != FILE_NAME:
+            print(f"  Ranged download: real filename is {served_name}")
+        FILE_NAME = served_name
+
+    work_path = dest_path + ".ranged"
+    mb = 1024 * 1024
+
+    def on_progress(done, total):
+        pct = 10 + int(68 * done / max(total, 1))
+        report_progress("downloading", pct,
+                        f"Downloading ({done // mb} / {total // mb} MB)")
+
+    print(f"  Ranged download: {size // mb} MB in 8 MB slices")
+    fetcher = RangedFetcher(url, work_path, size=size, on_progress=on_progress,
+                            deadline=RANGED_DEADLINE_SECONDS)
+    try:
+        got, secs, reqs = fetcher.run()
+    except RangedFetchError as e:
+        print(f"  Ranged download failed: {e}")
+        return False
+
+    if os.path.getsize(work_path) != size:
+        print(f"  Ranged download: size mismatch ({os.path.getsize(work_path)} != {size})")
+        return False
+
+    os.replace(work_path, dest_path)
+    fetcher.cleanup()
+    rate = (got / mb / secs) if secs else 0
+    print(f"  Ranged download complete: {got // mb} MB in {secs:.0f}s "
+          f"({rate:.1f} MB/s, {reqs} requests)")
+    return True
 
 
 def web_download(file_id: str, dest_path: str) -> bool:
@@ -1635,6 +1750,8 @@ def main():
     reserve_token = ""
     source_sha = ""
     verdict = {}
+
+    start_heartbeat()
 
     work_dir = tempfile.mkdtemp(prefix="pvl_build_")
     raw_path = os.path.join(work_dir, "raw_download")

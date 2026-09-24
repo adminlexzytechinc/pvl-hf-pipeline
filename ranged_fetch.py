@@ -14,17 +14,27 @@ It is NOT a clean switch: a ranged request is often served, not always.
 Over 12 sequential 8 MB chunks, 11 landed but 7 needed a retry. The retry
 loop is therefore load-bearing, not a nicety.
 
-WHY SEVERAL AT A TIME
----------------------
-The throttle is per-connection. Measured over the same 32 MB:
+WHY SEVERAL AT A TIME -- AND WHY THE COUNT ADAPTS
+------------------------------------------------
+Measured on GitHub runners, three runs, three IPs, 4 workers, same files:
 
-    1 worker  -> 0.41 MB/s
-    4 workers -> 1.43 MB/s   (3.5x)
-    8 workers -> 1.15 MB/s   (worse -- they fight for the same ceiling)
+    Fold5  24.73 GB   15.29   16.15   16.59 MB/s   (never throttled)
+    S741N  14.57 GB   22.24    3.65    0.33 MB/s   (pulled hard all night)
 
-Four is the measured sweet spot on one home connection. It is a default,
-not a law: the ceiling may be that link or a per-IP cap, and those two were
-not distinguished. Re-measure on the machine that will actually run this.
+No worker count was best every time. Concurrency is close to free on a file
+Google is not throttling and a gamble on one it is -- in one run 2 workers
+took 14 requests to land 4 chunks. So the width is not fixed: it starts
+narrow, doubles while every chunk lands on its first request, and halves when
+chunks need retries. The signal is requests-per-chunk, which bench_ranged.py
+reports for the same reason.
+
+A chunk that will not come now often comes a minute later. So a stubborn chunk
+is not retried until it gives up: after a few quick attempts it goes to the
+back of the queue and the rest of the file carries on. Only a chunk that has
+failed on every revisit ends the download.
+
+Laptop measurements were NOT representative and must not be used to tune
+this: from one home IP, 3 of 5 trials failed outright; on runners, 0 of 9.
 
 WHAT IT GUARANTEES
 ------------------
@@ -50,9 +60,11 @@ import requests
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
-DEFAULT_WORKERS = 4          # measured optimum; 8 was slower than 4
+DEFAULT_WORKERS = 4          # the ceiling; 8 was slower than 4 on every host measured
+DEFAULT_START_WORKERS = 2    # adaptive width starts here and earns the rest
 DEFAULT_CHUNK = 8 << 20      # 8 MiB
-DEFAULT_TRIES = 6
+DEFAULT_TRIES = 3            # quick attempts per visit before a chunk goes to the back
+DEFAULT_ROUNDS = 8           # visits before a chunk is declared unobtainable
 USERCONTENT = "https://drive.usercontent.google.com/download"
 
 
@@ -115,15 +127,36 @@ def probe(url, timeout=60):
 
 
 class RangedFetcher:
+    """
+    Pull [start, end] of `url` into `dest` as byte ranges, several at a time.
+
+    workers        the most connections ever open at once
+    start_workers  where the adaptive width begins (adaptive=True)
+    tries          quick attempts per visit to a chunk
+    rounds         visits before a chunk is declared unobtainable
+    deadline       optional wall-clock limit, seconds from run()
+    on_progress    called as on_progress(bytes_done, bytes_total)
+    """
+
     def __init__(self, url, dest, size=None, workers=DEFAULT_WORKERS,
-                 chunk=DEFAULT_CHUNK, tries=DEFAULT_TRIES,
-                 start=0, end=None, on_progress=None):
+                 chunk=DEFAULT_CHUNK, tries=DEFAULT_TRIES, start=0, end=None,
+                 on_progress=None, start_workers=DEFAULT_START_WORKERS,
+                 adaptive=True, rounds=DEFAULT_ROUNDS, deadline=None,
+                 backoff=None, cooldown=None):
         self.url = url
         self.dest = dest
-        self.workers = workers
+        self.workers = max(1, workers)
+        self.start_workers = max(1, min(start_workers, self.workers))
+        self.adaptive = adaptive
         self.chunk = chunk
-        self.tries = tries
+        self.tries = max(1, tries)
+        self.rounds = max(1, rounds)
+        self.deadline = deadline
         self.on_progress = on_progress
+        # Seconds to wait before attempt n of a visit. Injectable so tests do
+        # not sleep through real backoff.
+        self.backoff = backoff or (lambda attempt: min(2 ** attempt, 30))
+        self.cooldown = cooldown or (lambda visit: min(15 * visit, 120))
 
         self.size = size if size is not None else probe(url)[0]
         self.start = start
@@ -137,6 +170,7 @@ class RangedFetcher:
         self._done = set()
         self._bytes = 0
         self._requests = 0
+        self.stats = {"requests": 0, "revisits": 0, "widths": []}
         self._load_state()
 
     # ---- resume bookkeeping ---------------------------------------------
@@ -152,14 +186,16 @@ class RangedFetcher:
         if (s.get("url_size") == self.size and s.get("start") == self.start
                 and s.get("end") == self.end and s.get("chunk") == self.chunk):
             self._done = set(s.get("done", []))
-            self._bytes = len(self._done) * self.chunk
+            sizes = {i: last - first + 1 for i, first, last in self._chunks()}
+            self._bytes = sum(sizes.get(i, 0) for i in self._done)
 
     def _save_state(self):
         tmp = self.state_path + ".tmp"
+        with self._lock:
+            done = sorted(self._done)
         with open(tmp, "w") as f:
             json.dump({"url_size": self.size, "start": self.start,
-                       "end": self.end, "chunk": self.chunk,
-                       "done": sorted(self._done)}, f)
+                       "end": self.end, "chunk": self.chunk, "done": done}, f)
         os.replace(tmp, self.state_path)
 
     # ---- the work --------------------------------------------------------
@@ -176,6 +212,12 @@ class RangedFetcher:
         return out
 
     def _fetch_one(self, idx, first, last):
+        """
+        One visit to one chunk: up to `tries` quick attempts.
+        Returns the bytes written, or None if this visit did not land it --
+        the caller decides whether to come back. Raises only on a condition no
+        retry can fix.
+        """
         want = last - first + 1
         hdr = {"User-Agent": UA, "Range": "bytes=%d-%d" % (first, last)}
 
@@ -185,14 +227,11 @@ class RangedFetcher:
             try:
                 r = requests.get(self.url, headers=hdr, timeout=300, stream=True)
 
-                # The quota page. Not fatal -- back off and ask again.
-                if _is_html(r):
+                # The quota page, or any refusal. Not fatal -- back off and ask again.
+                if _is_html(r) or r.status_code not in (200, 206):
                     r.close()
-                    time.sleep(min(2 ** attempt, 30))
-                    continue
-                if r.status_code not in (200, 206):
-                    r.close()
-                    time.sleep(min(2 ** attempt, 30))
+                    if attempt < self.tries:
+                        time.sleep(self.backoff(attempt))
                     continue
 
                 # A 200 for a ranged ask means the server ignored the Range
@@ -210,31 +249,40 @@ class RangedFetcher:
                     for block in r.iter_content(1 << 20):
                         if not block:
                             continue
+                        # Never write past this chunk, whatever the server sends.
+                        block = block[:want - got]
                         f.write(block)
                         got += len(block)
+                        if got >= want:
+                            break
+                r.close()
 
                 if got != want:
-                    time.sleep(min(2 ** attempt, 30))
+                    if attempt < self.tries:
+                        time.sleep(self.backoff(attempt))
                     continue
 
                 with self._lock:
                     self._done.add(idx)
                     self._bytes += got
-                    if self.on_progress:
-                        self.on_progress(self._bytes, self.span)
+                    done_bytes = self._bytes
+                if self.on_progress:
+                    try:
+                        self.on_progress(done_bytes, self.span)
+                    except Exception:
+                        pass
                 return got
 
             except RangedFetchError:
                 raise
             except Exception:
-                time.sleep(min(2 ** attempt, 30))
-
-        raise RangedFetchError(
-            "chunk %d (bytes %d-%d) failed after %d attempts"
-            % (idx, first, last, self.tries))
+                if attempt < self.tries:
+                    time.sleep(self.backoff(attempt))
+        return None
 
     def run(self):
         """Fetch the window. Returns (bytes_written, seconds, requests_made)."""
+        from collections import deque
         from concurrent.futures import ThreadPoolExecutor
 
         # Preallocate so every worker can seek to its own offset.
@@ -242,26 +290,54 @@ class RangedFetcher:
             with open(self.dest, "ab") as f:
                 f.truncate(self.end + 1)
 
-        todo = [c for c in self._chunks() if c[0] not in self._done]
-        if not todo:
+        pending = deque(c for c in self._chunks() if c[0] not in self._done)
+        if not pending:
             return 0, 0.0, 0
 
         t0 = time.time()
-        errors = []
-
-        def work(c):
-            try:
-                self._fetch_one(*c)
-            except Exception as e:
-                errors.append(e)
+        visits = {}
+        width = self.start_workers if self.adaptive else self.workers
 
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
-            list(ex.map(work, todo))
+            while pending:
+                if self.deadline and time.time() - t0 > self.deadline:
+                    self._save_state()
+                    raise RangedFetchError(
+                        "deadline of %ds reached with %d chunk(s) left"
+                        % (self.deadline, len(pending)))
 
-        self._save_state()
-        if errors:
-            raise errors[0]
+                batch = [pending.popleft() for _ in range(min(width, len(pending)))]
+                before = self._requests
+                results = list(ex.map(lambda c: self._fetch_one(*c), batch))
+                used = self._requests - before
+                failed = [c for c, got in zip(batch, results) if got is None]
 
+                for c in failed:
+                    visits[c[0]] = visits.get(c[0], 0) + 1
+                    self.stats["revisits"] += 1
+                    if visits[c[0]] >= self.rounds:
+                        self._save_state()
+                        raise RangedFetchError(
+                            "chunk %d (bytes %d-%d) failed on %d visits of %d attempts"
+                            % (c[0], c[1], c[2], self.rounds, self.tries))
+                    # To the BACK: the rest of the file carries on, and this
+                    # one is asked again later, when the throttle may have eased.
+                    pending.append(c)
+
+                # A whole batch refused means every connection is being turned
+                # away. Asking again at once only feeds the throttle.
+                if failed and len(failed) == len(batch):
+                    time.sleep(self.cooldown(max(visits[c[0]] for c in failed)))
+
+                if self.adaptive:
+                    if not failed and used <= len(batch):
+                        width = min(width * 2, self.workers)
+                    elif failed or used > 1.5 * len(batch):
+                        width = max(1, width // 2)
+                self.stats["widths"].append(width)
+                self._save_state()
+
+        self.stats["requests"] = self._requests
         return self._bytes, time.time() - t0, self._requests
 
     def cleanup(self):

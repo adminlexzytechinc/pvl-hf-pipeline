@@ -114,7 +114,8 @@ ok('FILE_NAME = real_name' in ext, 'and the name is actually kept')
 # `lambda: ... -> bool` and a tuple would break every branch in it.
 ok('-> bool' in ext.split('\n')[0], 'the signature still returns bool',
    ext.split('\n')[0])
-casc = SRC[SRC.index('methods = ['):SRC.index('methods = [') + 400]
+_m = SRC.index('methods = [')
+casc = SRC[_m:SRC.index(chr(10) + '    ]', _m)]   # the whole list, not a fixed-size window
 ok('gas_try_folder_download(file_id, dest_path)' in casc,
    'the cascade still calls it with the same two arguments')
 
