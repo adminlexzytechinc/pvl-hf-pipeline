@@ -257,6 +257,10 @@ def strip_site_watermarks(filename: str) -> str:
     filename = _re.sub(r'_{2,}', '_', filename)
     filename = _re.sub(r'-{2,}', '-', filename)
     filename = filename.strip(' 	_-([')
+    # FIXED 2026-09-24 (same as pvl_strip_site_watermarks in pvl-match.php):
+    # the long/medium dashes of this site's own older branding
+    # ("..._190417 — lexzytechinc.com.zip") were left behind as "..._190417 —".
+    filename = filename.strip(' \t_-([–—')
 
     return filename + ext
 
@@ -1581,6 +1585,87 @@ def repack_staging_to_zip(staging_dir: str, output_zip_path: str, root_folder: s
                         dst.write(chunk)
 
 
+NESTED_ARCHIVE_EXTS = (".zip", ".7z", ".rar")
+LOCKED_SHARE_LIMIT = 0.5   # refuse when over half the firmware, by size, is locked
+
+
+def _archive_lock_state(path: str):
+    """(locked_bytes, total_bytes) for one archive's members, read by `7z l -slt`.
+
+    An empty password (-p) makes 7z answer instead of prompting. An archive
+    whose file LIST is itself encrypted cannot be listed at all; that is
+    reported as fully locked.
+    """
+    try:
+        res = subprocess.run(["7z", "l", "-slt", "-p", path], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    except Exception:
+        return 0, 0
+    out = res.stdout.decode("utf-8", errors="replace")
+    err = res.stderr.decode("utf-8", errors="replace")
+    if "Wrong password" in err or "Can not open encrypted archive" in err:
+        size = os.path.getsize(path)
+        return size, size
+    locked = total = 0
+    size, enc, folder = 0, False, False
+    for line in out.splitlines() + [""]:
+        if line.startswith("Size = "):
+            try:
+                size = int(line[7:].strip() or 0)
+            except ValueError:
+                size = 0
+        elif line.startswith("Encrypted = "):
+            enc = line.strip().endswith("+")
+        elif line.startswith("Folder = "):
+            folder = line.strip().endswith("+")
+        elif line.strip() == "":
+            if size and not folder:
+                total += size
+                if enc:
+                    locked += size
+            size, enc, folder = 0, False, False
+    return locked, total
+
+
+def find_password_locked(staging_dir: str) -> str:
+    """A reason to refuse the build, or '' when the firmware is usable.
+
+    Added 2026-09-24 after a real case. "Tecno Pouvoir 1 LA6 MT6580 7.0 Dead
+    Recovery ... Factroy Signed Firmware" passed every check and was published:
+    its outer archive is intact, but the firmware inside it is a second archive
+    with 17 of 18 files password-protected, shipped beside a "Contact Me For
+    Password" folder holding AnyDesk, UltraViewer and a stranger's email -- a
+    pay-for-the-password package. Every download of it was unusable.
+
+    Only archives INSIDE the extracted package are examined (an encrypted outer
+    archive already fails extraction). Measured by bytes, so a small locked
+    extra such as a tools archive does not reject real firmware beside it.
+    """
+    total_bytes = 0
+    locked_bytes = 0
+    worst = ""
+    for root, _dirs, files in os.walk(staging_dir):
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            total_bytes += size
+            if not name.lower().endswith(NESTED_ARCHIVE_EXTS):
+                continue
+            inner_locked, inner_total = _archive_lock_state(path)
+            if inner_total and inner_locked / inner_total > LOCKED_SHARE_LIMIT:
+                locked_bytes += size
+                if not worst:
+                    worst = name
+    if total_bytes and locked_bytes / total_bytes > LOCKED_SHARE_LIMIT:
+        return ("Firmware is password-protected (%s): %d%% of the package is locked "
+                "and cannot be flashed, so it was not uploaded."
+                % (worst, round(100 * locked_bytes / total_bytes)))
+    return ""
+
+
 def process_archive(source_path: str, output_path: str, original_name: str,
                     root_folder: str = "", clean_output_path: str = "",
                     add_branding: bool = True) -> dict:
@@ -1629,6 +1714,11 @@ def process_archive(source_path: str, output_path: str, original_name: str,
 
         if not extracted:
             raise RuntimeError(f"Could not extract archive {original_name}")
+
+        # FIXED 2026-09-24: refuse firmware that is password-locked inside.
+        locked = find_password_locked(staging_dir)
+        if locked:
+            raise RuntimeError(locked)
 
         # Flatten staging directory if there's a single top-level folder
         flatten_staging_dir(staging_dir)
