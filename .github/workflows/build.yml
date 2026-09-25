@@ -119,23 +119,13 @@ jobs:
       # This step reports the truth and moves the work to whichever volume is
       # actually largest. No third-party action: everything here is a shell
       # builtin, and nothing is removed that the build needs.
-      - name: Free disk and choose the largest volume
+      #
+      # CHANGED 2026-09-25: the preinstalled toolchains are no longer deleted
+      # here on every build. That took 85-125 s -- longer than the KL4h build
+      # itself (83 s) -- and a runner starts with 86 GB free. The worker now
+      # works out what each file needs and clears only then (disk_plan.py).
+      - name: Choose the largest volume
         run: |
-          echo "=== before ==="
-          df -h / /mnt 2>/dev/null || df -h /
-
-          # Reclaim space the build never uses. Each is a preinstalled toolchain
-          # that this workflow does not touch; failures are ignored on purpose
-          # because the runner image changes and a missing path is not an error.
-          sudo rm -rf /usr/share/dotnet                  || true
-          sudo rm -rf /usr/local/lib/android             || true
-          sudo rm -rf /opt/ghc                           || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL        || true
-          sudo rm -rf /usr/local/share/boost             || true
-          sudo rm -rf /usr/local/share/powershell        || true
-          sudo docker image prune --all --force          || true
-
-          echo "=== after ==="
           df -h / /mnt 2>/dev/null || df -h /
 
           # Put temporary work on the biggest writable volume. /mnt is a

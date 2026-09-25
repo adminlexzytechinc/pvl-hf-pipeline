@@ -20,6 +20,7 @@ import random
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -189,6 +190,27 @@ try:
     ok(False, 'stops at the deadline')
 except RangedFetchError as e:
     ok('deadline' in str(e), 'stops at the deadline and says so', str(e))
+
+print('\n== 6b. Every slice refused: stop on the stall limit, not the deadline ==')
+reset(refuse={i: -1 for i in range(11)})
+dest = fresh('stall.bin')
+f = RangedFetcher(URL, dest, size=len(DATA), chunk=CHUNK, tries=1, rounds=1000,
+                  deadline=60, stall=0.3, backoff=lambda a: 0, cooldown=lambda v: 0.05)
+t0 = time.time()
+try:
+    f.run()
+    ok(False, 'stops when no slice lands')
+except RangedFetchError as e:
+    ok('no slice served' in str(e) and time.time() - t0 < 5,
+       'stops after the stall limit, long before the deadline', str(e))
+
+print('\n== 6c. A slow file that keeps landing slices is NOT stopped ==')
+reset(refuse={2: 3, 6: 3})
+dest = fresh('slow.bin')
+f = RangedFetcher(URL, dest, size=len(DATA), chunk=CHUNK, tries=1, stall=0.5,
+                  backoff=lambda a: 0, cooldown=lambda v: 0.05)
+f.run()
+ok(same(dest), 'finishes intact while slices keep arriving')
 
 print('\n== 7. Fixed width when adaptive is off ==')
 reset()

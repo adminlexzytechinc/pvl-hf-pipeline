@@ -135,6 +135,9 @@ class RangedFetcher:
     tries          quick attempts per visit to a chunk
     rounds         visits before a chunk is declared unobtainable
     deadline       optional wall-clock limit, seconds from run()
+    stall          optional limit, seconds, on going without a single chunk
+                   landing; a file Drive refuses in every slice stops here
+                   instead of running into the deadline hours later
     on_progress    called as on_progress(bytes_done, bytes_total)
     """
 
@@ -142,7 +145,7 @@ class RangedFetcher:
                  chunk=DEFAULT_CHUNK, tries=DEFAULT_TRIES, start=0, end=None,
                  on_progress=None, start_workers=DEFAULT_START_WORKERS,
                  adaptive=True, rounds=DEFAULT_ROUNDS, deadline=None,
-                 backoff=None, cooldown=None):
+                 backoff=None, cooldown=None, stall=None):
         self.url = url
         self.dest = dest
         self.workers = max(1, workers)
@@ -152,6 +155,7 @@ class RangedFetcher:
         self.tries = max(1, tries)
         self.rounds = max(1, rounds)
         self.deadline = deadline
+        self.stall = stall
         self.on_progress = on_progress
         # Seconds to wait before attempt n of a visit. Injectable so tests do
         # not sleep through real backoff.
@@ -295,6 +299,7 @@ class RangedFetcher:
             return 0, 0.0, 0
 
         t0 = time.time()
+        last_landed = t0
         visits = {}
         width = self.start_workers if self.adaptive else self.workers
 
@@ -305,12 +310,19 @@ class RangedFetcher:
                     raise RangedFetchError(
                         "deadline of %ds reached with %d chunk(s) left"
                         % (self.deadline, len(pending)))
+                if self.stall and time.time() - last_landed > self.stall:
+                    self._save_state()
+                    raise RangedFetchError(
+                        "no slice served for %ds (%d chunk(s) left); Drive is "
+                        "refusing this file in slices too" % (self.stall, len(pending)))
 
                 batch = [pending.popleft() for _ in range(min(width, len(pending)))]
                 before = self._requests
                 results = list(ex.map(lambda c: self._fetch_one(*c), batch))
                 used = self._requests - before
                 failed = [c for c, got in zip(batch, results) if got is None]
+                if len(failed) < len(batch):
+                    last_landed = time.time()
 
                 for c in failed:
                     visits[c[0]] = visits.get(c[0], 0) + 1

@@ -46,6 +46,7 @@ import dedup_client
 import name_composer
 import payload_reader
 import zip_passthrough
+import disk_plan
 
 # ─────────────────────────────────────────────
 #  Configuration
@@ -1176,6 +1177,15 @@ def signed_url_download(file_id: str, dest_path: str) -> bool:
 # job itself is allowed 350 minutes (build.yml); this leaves room for the
 # repack and the Hugging Face upload of a large file.
 RANGED_DEADLINE_SECONDS = 270 * 60
+# Added 2026-09-25. A file Drive refuses in EVERY slice (seen on
+# Tecno_MegaPad_Pro_T1201, 4.7 GB: whole-file 429, then every slice answered
+# with the quota page) used to sit here until the deadline above -- 4.5 hours
+# before GAS copy was even tried. With no slice landing for this long, the
+# cascade moves on instead. 10 minutes, the same as the MEGA stall watchdog:
+# a refused slice is retried with short backoffs and a 15 s cool-down, so
+# 10 minutes is roughly 25 rounds and 75 refused requests -- far past the
+# point where a slice that was coming would have come.
+RANGED_STALL_SECONDS = 10 * 60
 
 
 def ranged_download(file_id: str, dest_path: str) -> bool:
@@ -1216,7 +1226,8 @@ def ranged_download(file_id: str, dest_path: str) -> bool:
 
     print(f"  Ranged download: {size // mb} MB in 8 MB slices")
     fetcher = RangedFetcher(url, work_path, size=size, on_progress=on_progress,
-                            deadline=RANGED_DEADLINE_SECONDS)
+                            deadline=RANGED_DEADLINE_SECONDS,
+                            stall=RANGED_STALL_SECONDS)
     try:
         got, secs, reqs = fetcher.run()
     except RangedFetchError as e:
@@ -1597,10 +1608,12 @@ def _write_branding_files(target_dir: str):
         f.write(WATERMARK_URL)
 
 
-def repack_staging_to_zip(staging_dir: str, output_zip_path: str, root_folder: str = ""):
+def repack_staging_to_zip(staging_dir: str, output_zip_path: str, root_folder: str = "",
+                          consume: bool = False):
     """Stream all files from staging_dir into a ZIP64 archive without high memory usage.
     If root_folder is set, all ZIP entry paths are prefixed with it to create
-    a single top-level folder inside the ZIP.
+    a single top-level folder inside the ZIP. With consume, each file is
+    deleted once it is in the ZIP, so the disk holds one copy, not two.
     """
     CHUNK_SIZE = 64 * 1024 * 1024  # 64MB streaming buffer
     with zipfile.ZipFile(output_zip_path, "w", zipfile.ZIP_STORED, allowZip64=True) as out_zip:
@@ -1617,6 +1630,8 @@ def repack_staging_to_zip(staging_dir: str, output_zip_path: str, root_folder: s
                         if not chunk:
                             break
                         dst.write(chunk)
+                if consume:
+                    os.remove(fpath)
 
 
 NESTED_ARCHIVE_EXTS = (".zip", ".7z", ".rar")
@@ -1702,7 +1717,7 @@ def find_password_locked(staging_dir: str) -> str:
 
 def process_archive(source_path: str, output_path: str, original_name: str,
                     root_folder: str = "", clean_output_path: str = "",
-                    add_branding: bool = True) -> dict:
+                    add_branding: bool = True, consume_source: bool = False) -> dict:
     """
     Extract archive (.rar, .7z, .zip, .tar), filter exclusions,
     restructure into firmware/ subfolder, optionally add brand text files,
@@ -1719,6 +1734,12 @@ def process_archive(source_path: str, output_path: str, original_name: str,
         add_branding: Write the branding files into the archive. False under
             SERVE_TIME_BRANDING, where the Worker appends them per request and
             the stored payload must stay brand-neutral.
+        consume_source: Delete source_path once it is unpacked, and each
+            unpacked file once it is in the final ZIP (added 2026-09-25). The
+            unpack route then needs the unpacked size once, not the download,
+            the unpacked files and the new ZIP all at the same time -- what
+            lets a 32 GB 7z fit on the runner. The caller has already hashed
+            the download and does not read it again.
     """
     # ADDED 2026-09-24: a ZIP is repacked by copying its compressed bytes
     # (zip_passthrough.py) -- no 25% growth, no extraction, seconds not
@@ -1773,6 +1794,9 @@ def process_archive(source_path: str, output_path: str, original_name: str,
         if not extracted:
             raise RuntimeError(f"Could not extract archive {original_name}")
 
+        if consume_source:
+            os.unlink(source_path)
+
         # FIXED 2026-09-24: refuse firmware that is password-locked inside.
         locked = find_password_locked(staging_dir)
         if locked:
@@ -1803,7 +1827,10 @@ def process_archive(source_path: str, output_path: str, original_name: str,
             # Serve-time branding: nothing brand-specific goes in the archive.
             report_progress("processing", 84, "Packaging brand-neutral ZIP...", force=True)
 
-        repack_staging_to_zip(staging_dir, output_path, root_folder=root_folder)
+        # The last repack may take the files as it goes; a dual build's clean
+        # ZIP above has already been written from them.
+        repack_staging_to_zip(staging_dir, output_path, root_folder=root_folder,
+                              consume=consume_source)
 
         print(f"  Processed archive: {stats['kept']} files kept, {stats['excluded']} excluded, "
               f"{stats['total_size'] // (1024*1024)} MB")
@@ -1975,6 +2002,7 @@ def main():
         is_mediafire = (SOURCE_TYPE == "mediafire") or FILE_ID.startswith("mf_") or ("mediafire.com" in (SOURCE_URL or ""))
         is_mega = (SOURCE_TYPE == "mega") or FILE_ID.startswith("mega_") or is_mega_url(SOURCE_URL or "")
         original_name = FILE_NAME
+        file_size = 0
 
         if not is_mediafire and not is_mega:
             report_progress("metadata", 2, "Fetching file info...", force=True)
@@ -1990,6 +2018,14 @@ def main():
                 print(f"  Metadata fetch failed (non-fatal): {e}")
 
         # ─── Step 2: Download from Source ───
+        # ADDED 2026-09-25: space is cleared only when this file needs it
+        # (disk_plan.py); the workflow no longer clears on every build.
+        if file_size:
+            no_room = disk_plan.ensure_space(work_dir, file_size + disk_plan.MARGIN, "download")
+            if no_room:
+                report_error(no_room)
+                sys.exit(1)
+
         report_progress("downloading", 5, "Starting download...", force=True)
 
         if not download_file(FILE_ID, raw_path):
@@ -2074,6 +2110,7 @@ def main():
         # archive itself counts highest). Identity keys stay on the vendor
         # string (key_name), so the added detail never splits a duplicate.
         facts = None
+        entries = []
         if is_extractable_archive(raw_path, original_name):
             entries = archive_entries(raw_path)
             if entries:
@@ -2121,11 +2158,18 @@ def main():
             print(f"  Branded name:  {branded_name}")
 
         # ─── Step 4: Process the File ───
-        if is_extractable_archive(raw_path, original_name):
+        is_archive = is_extractable_archive(raw_path, original_name)
+        need = disk_plan.extra_needed(raw_size, entries, zipfile.is_zipfile(raw_path), is_archive)
+        no_room = disk_plan.ensure_space(work_dir, need, "processing")
+        if no_room:
+            raise RuntimeError(no_room)
+
+        if is_archive:
             stats = process_archive(raw_path, processed_path, original_name,
                                     root_folder=root_folder,
                                     clean_output_path=clean_path if DUAL_BUILD else "",
-                                    add_branding=not SERVE_TIME_BRANDING)
+                                    add_branding=not SERVE_TIME_BRANDING,
+                                    consume_source=True)
         else:
             package_standalone_file(raw_path, processed_path, original_name,
                                    root_folder=root_folder,
