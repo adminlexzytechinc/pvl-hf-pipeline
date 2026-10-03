@@ -27,6 +27,16 @@ MAX_IDLE_SECONDS = 600
 MEGA_BIN = shutil.which("megatools")
 
 
+# Why the last mega_download() call failed (added 2026-09-26), read by the
+# worker to tell WordPress something useful:
+#   "stalled"    no progress for MAX_IDLE -- on a live file this is almost
+#                always MEGA's transfer limit on the build server's address
+#   "overquota"  megatools said so (quota / bandwidth / EOVERQUOTA)
+#   "error"      anything else;  ""  success
+LAST_FAILURE = ""
+_QUOTA_WORDS = re.compile(r"quota|bandwidth|EOVERQUOTA|transfer limit|-17\b", re.I)
+
+
 def mega_download(file_id: str, source_url: str, dest_path: str, progress_callback=None):
     """
     Download a MEGA file link to dest_path.
@@ -46,6 +56,8 @@ def mega_download(file_id: str, source_url: str, dest_path: str, progress_callba
     hf_build_worker's, which is an easy mistake to ship unnoticed since
     nothing raises when it happens.
     """
+    global LAST_FAILURE
+    LAST_FAILURE = "error"
     if MEGA_BIN is None:
         print("  MEGA download error: 'megatools' binary not found on PATH. "
               "Install it in the workflow (e.g. `apt-get install -y megatools` "
@@ -197,6 +209,8 @@ def mega_download(file_id: str, source_url: str, dest_path: str, progress_callba
             proc.kill()
             proc.wait(timeout=30)
             print(f"\n  MEGA download error: {timed_out_reason}")
+            if "stalled" in timed_out_reason:
+                LAST_FAILURE = "stalled"
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return False, None
 
@@ -220,6 +234,8 @@ def mega_download(file_id: str, source_url: str, dest_path: str, progress_callba
     if proc.returncode != 0:
         err_msg = "\n".join(err_lines[-5:]) if err_lines else f"exit {proc.returncode}"
         print(f"  MEGA download failed (exit {proc.returncode}): {err_msg}")
+        if _QUOTA_WORDS.search(err_msg):
+            LAST_FAILURE = "overquota"
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return False, None
 
@@ -234,5 +250,6 @@ def mega_download(file_id: str, source_url: str, dest_path: str, progress_callba
     shutil.move(os.path.join(tmp_dir, real_name), dest_path)
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    LAST_FAILURE = ""
     print(f"  MEGA download complete: {real_name} ({os.path.getsize(dest_path) // (1024*1024)} MB)")
     return True, real_name

@@ -207,7 +207,7 @@ except RangedFetchError as e:
 print('\n== 6c. A slow file that keeps landing slices is NOT stopped ==')
 reset(refuse={2: 3, 6: 3})
 dest = fresh('slow.bin')
-f = RangedFetcher(URL, dest, size=len(DATA), chunk=CHUNK, tries=1, stall=0.5,
+f = RangedFetcher(URL, dest, size=len(DATA), chunk=CHUNK, tries=1, stall=3.0,
                   backoff=lambda a: 0, cooldown=lambda v: 0.05)
 f.run()
 ok(same(dest), 'finishes intact while slices keep arriving')

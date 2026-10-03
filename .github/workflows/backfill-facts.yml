@@ -1,0 +1,44 @@
+name: Backfill Gold card details
+
+# Added 2026-09-26. Reads the Gold card details (Android, patch, chipset,
+# model, storage, Samsung bootloader) from files stored before builds started
+# reading them, remotely, without downloading the files. Run it by hand;
+# each run takes the next batch of files that have no details yet.
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'How many stored files to read this run'
+        required: false
+        default: '50'
+      dry_run:
+        description: 'Read and print only; send nothing to the site (true/false)'
+        required: false
+        default: 'false'
+      site_url:
+        description: 'Your site'
+        required: false
+        default: 'https://lexzytechinc.com'
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - name: Read details
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+          BUILD_CALLBACK_SECRET: ${{ secrets.BUILD_CALLBACK_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_ACCOUNTS: ${{ secrets.HF_ACCOUNTS }}
+          LIMIT: ${{ inputs.limit }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          ARGS="--limit ${LIMIT:-50}"
+          if [ "$DRY_RUN" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          python -u backfill_facts.py $ARGS

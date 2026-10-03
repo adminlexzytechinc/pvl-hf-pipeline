@@ -41,12 +41,14 @@ from huggingface_hub import HfApi
 
 from mega_url import is_mega_url
 from mega_download import mega_download
+import mega_download as mega_module
 from source_labels import source_label
 import dedup_client
 import name_composer
 import payload_reader
 import zip_passthrough
 import disk_plan
+import firmware_facts
 
 # ─────────────────────────────────────────────
 #  Configuration
@@ -417,19 +419,23 @@ def start_heartbeat():
     threading.Thread(target=beat, daemon=True).start()
 
 
-def report_error(message: str):
-    """Report a fatal error to WordPress."""
+def report_error(message: str, reason: str = ""):
+    """Report a fatal error to WordPress. `reason` (added 2026-09-26) is a
+    machine-readable kind, e.g. "google_blocked"; older WordPress ignores it."""
     _mark_final()
     print(f"[ERROR] {message}")
     try:
-        requests.post(CALLBACK_URL, json={
+        payload = {
             "build_id": BUILD_ID,
             "file_id":  FILE_ID,
             "secret":   CALLBACK_SECRET,
             "stage":    "error",
             "percent":  0,
             "message":  message,
-        }, timeout=10)
+        }
+        if reason:
+            payload["reason"] = reason
+        requests.post(CALLBACK_URL, json=payload, timeout=10)
     except Exception:
         pass
 
@@ -458,7 +464,7 @@ def report_duplicate(existing_file_id: str, reason: str = ""):
 
 
 def report_complete(hf_url: str, file_size: int, hf_url_clean: str = "", file_size_clean: int = 0,
-                    key_name: str = None):
+                    key_name: str = None, fw_facts: dict = None):
     """Report successful completion to WordPress.
 
     hf_url_clean / file_size_clean are only sent when a DUAL_BUILD run
@@ -491,6 +497,10 @@ def report_complete(hf_url: str, file_size: int, hf_url_clean: str = "", file_si
             # "AD8-..." are one build, but "x2" would split their keys.
             # Empty means the file's name carries no identity at all.
             payload["key_name"] = key_name
+        if fw_facts:
+            # ADDED 2026-09-26: the Gold card's details, read from inside
+            # the firmware (firmware_facts.py). Older WordPress ignores it.
+            payload["fw_facts"] = fw_facts
         requests.post(CALLBACK_URL, json=payload, timeout=10)
     except Exception:
         pass
@@ -698,6 +708,12 @@ def download_file(file_id: str, dest_path: str) -> bool:
             time.sleep(3)
 
         for name, pct, method in methods:
+            # ADDED 2026-09-26: a file Google refused in every slice is not
+            # asked again on the second pass -- that was 10 more minutes of
+            # runner time for the same answer (MegaPad 11 run, 2026-09-25).
+            if attempt > 1 and name == "Ranged download" and RANGED_REFUSED:
+                print("  Strategy: Ranged download -- skipped, Google refused every slice in pass 1")
+                continue
             # Strategy names ("GAS copy", "API download") are internal
             # quota-workaround details. They go to the build log only; the
             # user sees one steady message naming the actual source.
@@ -1186,6 +1202,8 @@ RANGED_DEADLINE_SECONDS = 270 * 60
 # 10 minutes is roughly 25 rounds and 75 refused requests -- far past the
 # point where a slice that was coming would have come.
 RANGED_STALL_SECONDS = 10 * 60
+# Set when Google refused every slice of this file (added 2026-09-26).
+RANGED_REFUSED = False
 
 
 def ranged_download(file_id: str, dest_path: str) -> bool:
@@ -1232,6 +1250,11 @@ def ranged_download(file_id: str, dest_path: str) -> bool:
         got, secs, reqs = fetcher.run()
     except RangedFetchError as e:
         print(f"  Ranged download failed: {e}")
+        if "no slice served" in str(e):
+            # Google refused every slice: remembered so the second pass of
+            # the cascade does not spend another 10 minutes asking again.
+            global RANGED_REFUSED
+            RANGED_REFUSED = True
         return False
 
     if os.path.getsize(work_path) != size:
@@ -1904,6 +1927,48 @@ def archive_entries(path: str) -> list:
         return []
 
 
+def archive_facts(raw_path: str, entries: list, payload: dict) -> dict:
+    """The Gold card's details, read from inside the downloaded archive
+    (added 2026-09-26; see firmware_facts.py). Reads only small members, or
+    the first few KB of boot.img. Never fails a build: on any problem it
+    returns what it has."""
+    names = [e["name"] for e in (entries or []) if e.get("name")]
+    if not names:
+        return {}
+    if zipfile.is_zipfile(raw_path):
+        zf = zipfile.ZipFile(raw_path)
+
+        def read(name, limit):
+            with zf.open(name) as fh:
+                return fh.read(limit)
+    else:
+        def read(name, limit):
+            # 7z/rar: stream just this member and stop after `limit` bytes.
+            # The name comes from inside the archive, so it is never allowed
+            # to read as a 7z option: a leading "-" is refused, and "--" ends
+            # option parsing before it.
+            if name.startswith("-"):
+                return b""
+            proc = subprocess.Popen(["7z", "e", "-so", "-p", "--", raw_path, name],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+            try:
+                data = proc.stdout.read(limit)
+            finally:
+                proc.kill()
+                proc.wait(timeout=30)
+            return data
+    try:
+        facts = firmware_facts.collect(names, read, payload or {})
+    except Exception as e:
+        print(f"  Card details not read ({e})")
+        return {}
+    shown = [f"{k} {facts[k]}" for k in ("android", "security_patch", "chipset", "model", "storage", "bootloader")
+             if facts.get(k)]
+    print("  Card details: " + (", ".join(shown) if shown else "none found in the archive"))
+    return facts
+
+
 def package_standalone_file(raw_path: str, output_path: str, original_name: str,
                            root_folder: str = "", add_branding: bool = True):
     """
@@ -2029,7 +2094,20 @@ def main():
         report_progress("downloading", 5, "Starting download...", force=True)
 
         if not download_file(FILE_ID, raw_path):
-            report_error("All download methods failed. File may be restricted or quota fully exhausted.")
+            if mega_module.LAST_FAILURE in ("stalled", "overquota"):
+                # ADDED 2026-09-26: say what happened instead of "all methods
+                # failed". The file is usually fine; MEGA is limiting the
+                # build server. WordPress waits 6 hours before retrying.
+                report_error("MEGA is limiting downloads to the build server right now (its transfer limit). "
+                             "It will be tried again later.", reason="mega_limited")
+            elif RANGED_REFUSED:
+                # Every identity and route was refused while the file itself
+                # exists (its size was read): Google's per-file download
+                # block. It lifts on its own, usually within a day.
+                report_error("Google is blocking downloads of this file right now (too many downloads). "
+                             "It will be tried again later.", reason="google_blocked")
+            else:
+                report_error("All download methods failed. File may be restricted or quota fully exhausted.")
             sys.exit(1)
 
         # Update original_name: if download recovered a non-generic filename (e.g. from MEGA or MediaFire Content-Disposition), adopt it!
@@ -2157,6 +2235,9 @@ def main():
         else:
             print(f"  Branded name:  {branded_name}")
 
+        # Read BEFORE Step 4: the unpack route deletes the download.
+        fw_facts = archive_facts(raw_path, entries, facts) if entries else {}
+
         # ─── Step 4: Process the File ───
         is_archive = is_extractable_archive(raw_path, original_name)
         need = disk_plan.extra_needed(raw_size, entries, zipfile.is_zipfile(raw_path), is_archive)
@@ -2222,7 +2303,7 @@ def main():
             dedup_client.record_unchecked(FILE_ID, source_sha, verdict.get("reason", ""))
 
         # ─── Step 6: Report completion ───
-        report_complete(hf_url, processed_size, hf_url_clean, clean_size, key_name=key_name)
+        report_complete(hf_url, processed_size, hf_url_clean, clean_size, key_name=key_name, fw_facts=fw_facts)
 
         print("\n" + "=" * 60)
         print("BUILD SUCCESSFUL")
