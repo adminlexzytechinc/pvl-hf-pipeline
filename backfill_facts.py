@@ -60,7 +60,8 @@ def read_facts(url, token):
     entries = rz.entries()
     names = [e["name"] for e in entries if not e["name"].endswith("/")]
     payload = payload_reader.read_payload([{"name": e["name"], "size": e["size"]} for e in entries])
-    return firmware_facts.collect(names, lambda n, lim: rz.read(n, limit=lim), payload)
+    return firmware_facts.collect(names, lambda n, lim: rz.read(n, limit=lim), payload,
+                                  opener=rz.open_stored)
 
 
 def report(site, secret, file_id, facts):

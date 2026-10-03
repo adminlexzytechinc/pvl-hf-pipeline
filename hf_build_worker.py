@@ -1941,7 +1941,16 @@ def archive_facts(raw_path: str, entries: list, payload: dict) -> dict:
         def read(name, limit):
             with zf.open(name) as fh:
                 return fh.read(limit)
+
+        def opener(name):
+            # build.prop inside super.img, read in place. Only for a STORED
+            # member: seeking back in a compressed one re-inflates gigabytes.
+            if zf.getinfo(name).compress_type != zipfile.ZIP_STORED:
+                return None
+            return zf.open(name)
     else:
+        opener = None
+
         def read(name, limit):
             # 7z/rar: stream just this member and stop after `limit` bytes.
             # The name comes from inside the archive, so it is never allowed
@@ -1959,7 +1968,7 @@ def archive_facts(raw_path: str, entries: list, payload: dict) -> dict:
                 proc.wait(timeout=30)
             return data
     try:
-        facts = firmware_facts.collect(names, read, payload or {})
+        facts = firmware_facts.collect(names, read, payload or {}, opener)
     except Exception as e:
         print(f"  Card details not read ({e})")
         return {}
@@ -2205,8 +2214,19 @@ def main():
         vendor = name_composer.vendor_base("" if is_generic_filename(base_name) else base_name, root_base,
                                            samsung_code)
         key_name = f"{vendor}.zip" if vendor else ""
+        # Read BEFORE Step 4 (the unpack route deletes the download), and
+        # before naming: the name check uses the phone's REAL model (from its
+        # own words, model_reader.py), never the preloader's project name --
+        # KH7N inside the KH7S firmware put "KH7N_" on the KH7S file
+        # (2026-10-03).
+        fw_facts = archive_facts(raw_path, entries, facts) if entries else {}
+        naming_facts = dict(facts) if facts else None
+        if naming_facts is not None and naming_facts.get("container") != "samsung_odin":
+            naming_facts.pop("model_code", None)
+            if fw_facts.get("model"):
+                naming_facts["model_code"] = fw_facts["model"]
         composed, decisions = name_composer.stored_base_name(
-            vendor, name_composer.parse_device_info(DEVICE_INFO), facts)
+            vendor, name_composer.parse_device_info(DEVICE_INFO), naming_facts)
         for field, d in decisions.items():
             if d.get("status") != "omitted":
                 print(f"  Name {field}: {d['status']} ({d['why']})")
@@ -2235,8 +2255,6 @@ def main():
         else:
             print(f"  Branded name:  {branded_name}")
 
-        # Read BEFORE Step 4: the unpack route deletes the download.
-        fw_facts = archive_facts(raw_path, entries, facts) if entries else {}
 
         # ─── Step 4: Process the File ───
         is_archive = is_extractable_archive(raw_path, original_name)

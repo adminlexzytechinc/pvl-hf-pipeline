@@ -220,6 +220,16 @@ class RemoteZip:
             raw, limit if limit else 0)
         return data
 
+    def open_stored(self, name):
+        """A seekable read-only file over a STORED member, or None when the
+        member is deflated. Reads ahead 256 KB per request. Used to read
+        build.prop out of super.img without downloading it (2026-10-03)."""
+        try:
+            e = self._find(name)
+        except Exception:
+            return None
+        return _StoredMember(self, e["name"], e["size"]) if e["method"] == 0 else None
+
     def peek(self, name, offset, length):
         """Read `length` bytes from `offset` INSIDE a member.
 
@@ -240,3 +250,32 @@ class RemoteZip:
             return b""
         start = self._data_offset(e) + offset
         return self._get(start, start + length - 1)
+
+
+class _StoredMember:
+    AHEAD = 256 * 1024
+
+    def __init__(self, rz, name, size):
+        self.rz, self.name, self.size = rz, name, size
+        self.pos, self.buf_off, self.buf = 0, -1, b""
+
+    def seek(self, pos, whence=0):
+        self.pos = pos if whence == 0 else (self.pos + pos if whence == 1 else self.size + pos)
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            n = self.size - self.pos
+        off = self.pos
+        if not (self.buf_off <= off and off + n <= self.buf_off + len(self.buf)):
+            if n > self.AHEAD:
+                data = self.rz.peek(self.name, off, n)
+                self.pos += len(data)
+                return data
+            self.buf_off, self.buf = off, self.rz.peek(self.name, off, self.AHEAD)
+        data = self.buf[off - self.buf_off:off - self.buf_off + n]
+        self.pos += len(data)
+        return data

@@ -5,6 +5,7 @@ old-style boot.img header, a scatter file and a preloader, served with HTTP
 ranges and refused without the repo's token. No network.
 """
 
+import gzip
 import io
 import json
 import os
@@ -38,12 +39,36 @@ def boot_v0(a, b, y, m):
     return bytes(h)
 
 
+def cpio(files):
+    out = b''
+    for i, (name, body) in enumerate(list(files.items()) + [('TRAILER!!!', b'')]):
+        n = name.encode() + b'\0'
+        out += (b'070701' + b'%08X' % (i + 1) + b'%08X' % 0o100644 + b'0' * 32 + b'%08X' % len(body)
+                + b'0' * 32 + b'%08X' % len(n) + b'0' * 8) + n
+        out += b'\0' * (-len(out) % 4) + body
+        out += b'\0' * (-len(out) % 4)
+    return out
+
+
+def recovery_v0(props):
+    """A recovery image whose ramdisk carries default.prop -- where an old
+    phone keeps its own model (ro.product.model), added 2026-10-03."""
+    ramdisk = gzip.compress(cpio({'default.prop': props.encode()}))
+    h = bytearray(2048)
+    h[:8] = b'ANDROID!'
+    struct.pack_into('<IIII', h, 8, 4096, 0, len(ramdisk), 0)
+    struct.pack_into('<I', h, 36, 2048)
+    return bytes(h) + os.urandom(4096) + ramdisk
+
+
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
     z.writestr('Tecno_Pouvoir_3_LB7/firmware/boot.img', boot_v0(8, 1, 2020, 8) + os.urandom(200000))
     z.writestr('Tecno_Pouvoir_3_LB7/firmware/MT6739_Android_scatter.txt', 'storage: HW_STORAGE_EMMC\n' * 50)
     z.writestr('Tecno_Pouvoir_3_LB7/firmware/preloader_lb7_h393.bin', os.urandom(1000))
     z.writestr('Tecno_Pouvoir_3_LB7/firmware/system.img', os.urandom(300000))
+    z.writestr('Tecno_Pouvoir_3_LB7/firmware/recovery.img',
+               recovery_v0('ro.product.brand=TECNO\nro.product.model=TECNO LB7\nro.product.device=TECNO-LB7\n'))
 STORED = buf.getvalue()
 
 STATE = {'reports': [], 'ranges': 0, 'bytes': 0}
@@ -112,6 +137,8 @@ rep = {r['file_id']: r for r in STATE['reports']}
 f = rep.get('mf_lb7', {}).get('fw_facts', {})
 ok(f.get('android') == '8.1' and f.get('security_patch') == '2020-08' and f.get('chipset') == 'MT6739'
    and f.get('model') == 'LB7' and f.get('storage') == 'eMMC', 'details read remotely: 8.1, 2020-08, MT6739, LB7, eMMC', f)
+ok('recovery.img' in f.get('model_source', '') and 'preloader' not in f.get('model_source', ''),
+   "the model is the phone's own (recovery settings), not the preloader's name", f.get('model_source'))
 ok(rep.get('mf_lb7', {}).get('stage') == 'facts', 'sent as a "facts" report (writes only the details)')
 ok('gone' not in rep and rc == 1, 'a file that cannot be read is reported as FAILED, not sent', rc)
 ok(STATE['bytes'] < len(STORED), 'read %d of %d bytes (only the index and small parts)' % (STATE['bytes'], len(STORED)))

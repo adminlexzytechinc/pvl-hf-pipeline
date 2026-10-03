@@ -20,7 +20,10 @@ Android and security patch
      which is wrong for the phone. Older phones are right: Tecno LB7
      (header v0) says 8.1.0, 2020-08.
   4. Samsung: "_OS16" in the AP file's name.
-Chipset, model: payload_reader (scatter, preloader, APDB, Odin part names).
+Chipset: payload_reader (scatter, preloader, APDB).
+Model: the phone's own words -- model_reader.py (vbmeta label, recovery
+  settings, build.prop); Samsung: the Odin part names. Never the preloader
+  filename, which is the project name (2026-10-03).
 Storage: the scatter's HW_STORAGE_* -- shown only when it names ONE type.
   Newer MediaTek scatters list both eMMC and UFS (one firmware for both
   kinds of phone); then there is no single answer and the field is left out.
@@ -33,6 +36,8 @@ archive, the backfill reads the stored file over HTTP ranges (remote_zip).
 
 import re
 import struct
+
+import model_reader
 
 PROP = re.compile(
     rb'com\.android\.build\.([a-z_]+)\.(security_patch|os_version|fingerprint)\x00([\x20-\x7e]{1,160})\x00')
@@ -111,11 +116,13 @@ def samsung_bootloader(build_code):
     return c if c.isdigit() else str(ord(c) - ord('A') + 10)
 
 
-def collect(names, read, payload=None):
+def collect(names, read, payload=None, opener=None):
     """
     names    every member path in the archive
     read     read(name, limit) -> bytes or None
     payload  payload_reader.read_payload() output, when the caller has it
+    opener   optional opener(name) -> seekable file, for build.prop inside
+             super.img (Android 10); without it that step is skipped
 
     Returns the card's facts, each with a matching '<field>_source'.
     """
@@ -125,7 +132,11 @@ def collect(names, read, payload=None):
 
     if payload.get('soc'):
         facts['chipset'], facts['chipset_source'] = payload['soc'], 'archive contents'
-    if payload.get('model_code'):
+    # The model: Samsung's comes from the Odin part names (payload). Every
+    # other phone's comes from its own words (model_reader.py, 2026-10-03).
+    # The preloader filename is the PROJECT name, not the phone (KH7N inside
+    # the KH7S firmware), so it is never used as the model.
+    if payload.get('container') == 'samsung_odin' and payload.get('model_code'):
         facts['model'] = payload['model_code']
         facts['model_source'] = payload.get('model_code_source', 'archive contents')
 
@@ -137,6 +148,15 @@ def collect(names, read, payload=None):
                 props.update({k: v for k, v in avb_properties(read(leaves[leaf], 65536)).items() if k not in props})
             except Exception:
                 pass
+    if 'model' not in facts and payload.get('container') != 'samsung_odin':
+        fps = {part: v for (part, key), v in props.items() if key == 'fingerprint'}
+        try:
+            model, m_src = model_reader.real_model(leaves, read, fps, opener)
+        except Exception:
+            model, m_src = '', ''
+        if model:
+            facts['model'], facts['model_source'] = model, m_src
+
     android, a_src = _android_from_props(props)
     patch, p_src = _patch_from_props(props)
 
