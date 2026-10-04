@@ -42,6 +42,7 @@ from huggingface_hub import HfApi
 from mega_url import is_mega_url
 from mega_download import mega_download
 import mega_download as mega_module
+import afh_download as afh_module
 from source_labels import source_label
 import dedup_client
 import name_composer
@@ -158,7 +159,7 @@ def is_generic_filename(name: str) -> bool:
         "none", "null", "undefined",
         "get", "get.zip", "link", "link.zip",
         "mega", "mega.zip", "mega.nz", "mega.io", "maga", "maga.zip",
-        "mediafire", "mediafire.com", "gdrive", "drive"
+        "mediafire", "mediafire.com", "gdrive", "drive", "androidfilehost", "androidfilehost.com"
     )
     if clean_lower in generic_words:
         return True
@@ -184,6 +185,11 @@ def is_generic_filename(name: str) -> bool:
             raw_mf_id = FILE_ID[3:].lower()
             if base_lower == raw_mf_id or clean_lower == raw_mf_id:
                 return True
+        # If FILE_ID is afh_xxx, check raw xxx (AndroidFileHost, 2026-10-04)
+        if FILE_ID.startswith("afh_"):
+            raw_afh_id = FILE_ID[4:].lower()
+            if base_lower == raw_afh_id or clean_lower == raw_afh_id:
+                return True
         # If FILE_ID is mega_xxx, check raw xxx
         if FILE_ID.startswith("mega_"):
             raw_mega_id = FILE_ID[5:].lower()
@@ -191,7 +197,7 @@ def is_generic_filename(name: str) -> bool:
                 return True
 
     # 4. Check if it's purely an ID prefix like pvl_... or mf_ or mega_ followed only by ID chars
-    if _re.match(r'^(?:mf_|pvl_|mega_)[a-zA-Z0-9_-]{6,60}$', base, _re.I):
+    if _re.match(r'^(?:mf_|pvl_|mega_|afh_)[a-zA-Z0-9_-]{6,60}$', base, _re.I):
         return True
 
     # 5. Raw Google Drive ID / hash pattern (25-45 random alphanumeric chars, but NOT containing firmware separators/words)
@@ -669,6 +675,31 @@ def download_file(file_id: str, dest_path: str) -> bool:
             print(f"  MEGA download verified intact: {reason}")
             return True
         return False
+
+    # ─── AndroidFileHost Source (added 2026-10-04) ───
+    if afh_module.is_afh(SOURCE_TYPE, file_id, SOURCE_URL or ""):
+        report_progress("downloading", 10, f"Connecting to {SRC}...", force=True)
+
+        def on_afh_progress(done, total):
+            if total:
+                report_progress("downloading", 10 + int(done / total * 65),
+                                f"Downloaded {done // (1024*1024)} / {total // (1024*1024)} MB")
+
+        ok, real_name = afh_module.afh_download(file_id, SOURCE_URL or "", dest_path, progress=on_afh_progress)
+        if real_name and not is_generic_filename(real_name):
+            FILE_NAME = real_name
+        if not ok or not os.path.exists(dest_path):
+            return False
+        ok, reason = verify_archive_integrity(dest_path, FILE_NAME)
+        if not ok:
+            print(f"  AndroidFileHost download failed integrity check: {reason}")
+            try:
+                os.unlink(dest_path)
+            except Exception:
+                pass
+            return False
+        print(f"  AndroidFileHost download verified intact: {reason}")
+        return True
 
     # ─── MediaFire Source ───
     is_mediafire = (SOURCE_TYPE == "mediafire") or file_id.startswith("mf_") or ("mediafire.com" in (SOURCE_URL or ""))
@@ -2100,10 +2131,21 @@ def main():
         # ─── Step 1: Get file metadata ───
         is_mediafire = (SOURCE_TYPE == "mediafire") or FILE_ID.startswith("mf_") or ("mediafire.com" in (SOURCE_URL or ""))
         is_mega = (SOURCE_TYPE == "mega") or FILE_ID.startswith("mega_") or is_mega_url(SOURCE_URL or "")
+        is_afh = afh_module.is_afh(SOURCE_TYPE, FILE_ID, SOURCE_URL or "")
         original_name = FILE_NAME
         file_size = 0
 
-        if not is_mediafire and not is_mega:
+        if is_afh:
+            report_progress("metadata", 2, "Fetching file info...", force=True)
+            try:
+                info = afh_module.file_info(afh_module.parse_fid(FILE_ID, SOURCE_URL or ""))
+                if info["name"] and not is_generic_filename(info["name"]):
+                    original_name = info["name"]
+                file_size = info["size"]
+                print(f"  File: {original_name} ({file_size // (1024*1024)} MB, AndroidFileHost)")
+            except Exception as e:
+                print(f"  AndroidFileHost info failed (non-fatal): {e}")
+        elif not is_mediafire and not is_mega:
             report_progress("metadata", 2, "Fetching file info...", force=True)
             try:
                 meta = get_file_metadata(FILE_ID)
@@ -2146,7 +2188,7 @@ def main():
 
         # Update original_name: if download recovered a non-generic filename (e.g. from MEGA or MediaFire Content-Disposition), adopt it!
         if FILE_NAME and not is_generic_filename(FILE_NAME):
-            if is_generic_filename(original_name) or is_mega or is_mediafire:
+            if is_generic_filename(original_name) or is_mega or is_mediafire or is_afh:
                 original_name = FILE_NAME
 
         # Fallback to URL path or FILE_ID if still generic

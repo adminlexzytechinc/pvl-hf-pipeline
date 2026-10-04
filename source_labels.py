@@ -24,6 +24,7 @@ SOURCE_LABELS = {
     "gdrive":    "Google Drive",
     "mediafire": "MediaFire",
     "mega":      "MEGA",
+    "afh":       "AndroidFileHost",
 }
 
 DEFAULT_LABEL = "the source"
@@ -50,10 +51,14 @@ def source_label(source_type: str = "", file_id: str = "", source_url: str = "")
         return SOURCE_LABELS["mediafire"]
     if fid.startswith("mega_"):
         return SOURCE_LABELS["mega"]
+    if fid.startswith("afh_"):
+        return SOURCE_LABELS["afh"]
 
     url = (source_url or "").lower()
     if "mediafire.com" in url:
         return SOURCE_LABELS["mediafire"]
+    if "androidfilehost.com" in url:
+        return SOURCE_LABELS["afh"]
     if any(h in url for h in ("mega.nz", "mega.io", "mega.co.nz")):
         return SOURCE_LABELS["mega"]
     if any(h in url for h in ("drive.google.com", "docs.google.com",
