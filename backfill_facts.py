@@ -41,9 +41,11 @@ def ajax(site):
     return site.rstrip("/") + "/wp-admin/admin-ajax.php"
 
 
-def todo(site, secret, limit):
-    r = requests.post(ajax(site) + "?action=pvl_facts_todo",
-                      json={"secret": secret, "limit": limit}, timeout=60)
+def todo(site, secret, limit, recheck=False):
+    body = {"secret": secret, "limit": limit}
+    if recheck:
+        body["recheck"] = True
+    r = requests.post(ajax(site) + "?action=pvl_facts_todo", json=body, timeout=60)
     r.raise_for_status()
     body = r.json()
     if not body.get("success"):
@@ -76,6 +78,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=50)
     ap.add_argument("--dry-run", action="store_true", help="read and print, send nothing")
+    ap.add_argument("--recheck", action="store_true",
+                    help="also re-read files an earlier run found nothing in")
     args = ap.parse_args(argv)
 
     site = os.environ.get("SITE_URL", "https://lexzytechinc.com")
@@ -88,7 +92,7 @@ def main(argv=None):
     if not secret:
         sys.exit("BUILD_CALLBACK_SECRET is not set")
 
-    files = todo(site, secret, args.limit)
+    files = todo(site, secret, args.limit, args.recheck)
     print("%d stored file(s) without Gold card details" % len(files))
     done = empty = failed = 0
     for f in files:

@@ -105,6 +105,62 @@ ok(payload.get("model_code") == "KH7N" and "model" not in facts,
 meta = name_composer.naming_meta({"model": {"value": "KH7S", "source": "ai"}}, {"model_code": "KH7S"})
 ok("_contradiction" not in meta, "the real model KH7S on the KH7S post: no contradiction")
 
+print("\n== Rules added 2026-10-04 (from the backfill of 150 stored files) ==")
+ok(mr.from_props({"ro.product.brand": "Infinix", "ro.product.model": "Infinix S2",
+                  "ro.product.device": "Infinix-X522"})[0] == "X522",
+   '"Infinix S2" is a marketing name: the device code X522 names the phone')
+ok(mr.from_props({"ro.product.brand": "Infinix", "ro.product.model": "Infinix X626B LTE",
+                  "ro.product.device": "Infinix-X626B"})[0] == "X626B", '"X626B LTE" -> X626B')
+ok(mr.from_props({"ro.product.brand": "TECNO", "ro.product.model": "TECNO LA7 Pro",
+                  "ro.product.device": "TECNO-LA7-13M"})[0] == "LA7 Pro", '"LA7 Pro" still kept (Pro is part of the model)')
+ok(mr.from_fingerprint("realme/RMX3933/RE6099:14/UP1A/T.R4T2:user/release-keys") == "RMX3933",
+   "realme/OPPO name the model in the middle part: RMX3933")
+ok(mr.from_fingerprint("UNISOC/ussi_arm64_full/ussi_arm64:16/BP2A/4483:user/release-keys") == "",
+   "Unisoc's shared system label names no phone")
+ok(mr.from_fingerprint("Xiaomi/lavender/lavender:10/x:user/release-keys") == "", "a codename is still not a model")
+
+
+def fake_pac(version, vbmeta_props):
+    """A .pac with the real layout: header, entries every 2580 bytes from
+    2124, a vbmeta image inside."""
+    import struct as st
+    avb = b"AVB0" + bytes(60)
+    for part, key, val in vbmeta_props:
+        avb += ("com.android.build.%s.%s" % (part, key)).encode() + b"\0" + val.encode() + b"\0"
+    avb += bytes(4096 - len(avb))
+    entries = [("FDL", "fdl1-sign.bin", 1000), ("VBMETA", "vbmeta-sign.img", len(avb)), ("Super", "super.img", 5000)]
+    table_end = 2124 + 2580 * len(entries)
+    data_off = table_end
+    head = bytearray(2124)
+    head[0:48] = version.encode("utf-16-le").ljust(48, b"\0")
+    blob = bytearray()
+    tab = bytearray()
+    for fid, name, size in entries:
+        e = bytearray(2580)
+        e[0:4] = st.pack("<I", 2580)
+        e[4:516] = fid.encode("utf-16-le").ljust(512, b"\0")
+        e[516:1028] = name.encode("utf-16-le").ljust(512, b"\0")
+        e[1540:1556] = st.pack("<4I", size, 0, 0, data_off + len(blob))
+        tab += e
+        blob += avb if fid == "VBMETA" else bytes(size)
+    return bytes(head + tab + blob)
+
+
+import io  # noqa: E402
+pac = fake_pac("BP_R1.0.0", [("vendor", "fingerprint", "Itel/P662L-GL/itel-P662L:12/SP1A/V261:user/release-keys"),
+                             ("system", "os_version", "13"), ("product", "os_version", "15"),
+                             ("system", "security_patch", "2023-03-05"), ("product", "security_patch", "2026-05-01")])
+blobs = mr.pac_vbmeta_blobs(io.BytesIO(pac))
+ok(len(blobs) == 1 and blobs[0][:4] == b"AVB0", "a Unisoc .pac: its vbmeta image is found and read from the table", len(blobs))
+ok(mr.pac_vbmeta_blobs(io.BytesIO(b"PK\x03\x04" + bytes(5000))) == [], "not a .pac: nothing read, nothing guessed")
+f = firmware_facts.collect(["Itel_P40/P662L.pac"], lambda n, lim: pac[:lim], {}, opener=lambda n: io.BytesIO(pac))
+ok(f.get("model") == "P662L" and f.get("android") == "15" and f.get("security_patch") == "2026-05-01",
+   "the card gets P662L, and the NEWEST Android/patch among system/product (15, not the base 13)", f)
+bp = b"ro.system.build.fingerprint=realme/RMX3933/RE6099:14/UP1A/T:user/release-keys\nro.build.version.release=14\nro.build.version.security_patch=2024-11-05\n"
+f = firmware_facts.collect(["x/ums9230.pac", "x/build.prop"], lambda n, lim: bp[:lim] if n.endswith("build.prop") else b"", {})
+ok(f.get("model") == "RMX3933" and f.get("android") == "14" and f.get("security_patch") == "2024-11-05",
+   "a loose build.prop beside the .pac (realme): RMX3933, Android 14, patch 2024-11-05", f)
+
 print("\n== Your two Spark 9 Pro archives ==")
 D = "C:/Users/lexzy/Downloads/Compressed"
 for fn, want in (("[Hovatek]_Tecno_Spark_9_Pro_(KH7S-H6919F-S-MXTC-221012V288).zip", "KH7S"),

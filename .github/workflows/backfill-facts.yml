@@ -15,6 +15,10 @@ on:
         description: 'Read and print only; send nothing to the site (true/false)'
         required: false
         default: 'false'
+      recheck:
+        description: 'Also re-read files an earlier run found nothing in (true/false)'
+        required: false
+        default: 'false'
       site_url:
         description: 'Your site'
         required: false
@@ -38,7 +42,9 @@ jobs:
           HF_ACCOUNTS: ${{ secrets.HF_ACCOUNTS }}
           LIMIT: ${{ inputs.limit }}
           DRY_RUN: ${{ inputs.dry_run }}
+          RECHECK: ${{ inputs.recheck }}
         run: |
           ARGS="--limit ${LIMIT:-50}"
           if [ "$DRY_RUN" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ "$RECHECK" = "true" ]; then ARGS="$ARGS --recheck"; fi
           python -u backfill_facts.py $ARGS

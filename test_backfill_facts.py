@@ -91,6 +91,7 @@ class H(BaseHTTPRequestHandler):
         if data.get('secret') != 'cb-secret':
             return self._json({'success': False, 'data': 'Unauthorized'}, 401)
         if 'pvl_facts_todo' in self.path:
+            STATE.setdefault('todo', []).append(data)
             base = 'http://127.0.0.1:%d' % self.server.server_address[1]
             return self._json({'success': True, 'data': {'files': [
                 {'file_id': 'mf_lb7', 'file_name': 'Tecno_Pouvoir_3_LB7.zip', 'repo_slug': 'fw-1',
@@ -144,6 +145,16 @@ ok('gone' not in rep and rc == 1, 'a file that cannot be read is reported as FAI
 ok(STATE['bytes'] < len(STORED), 'read %d of %d bytes (only the index and small parts)' % (STATE['bytes'], len(STORED)))
 ok(bf.token_for('fw-1', {'fw-1': 'hf_fw1'}, 'x') == 'hf_fw1' and bf.token_for('fw-9', {}, 'x') == 'x',
    "each repo's own token, else HF_TOKEN")
+
+print("\n== Recheck ==")
+STATE['todo'] = []
+bf.main(['--dry-run'])
+bf.main(['--dry-run', '--recheck'])
+ok('recheck' not in STATE['todo'][0] and STATE['todo'][1].get('recheck') is True,
+   'only --recheck asks WordPress for the files found empty before', STATE['todo'])
+wf = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.github', 'workflows', 'backfill-facts.yml'),
+          encoding='utf-8').read()
+ok('recheck:' in wf and 'ARGS="$ARGS --recheck"' in wf, 'the Actions form has a recheck box')
 
 srv.shutdown()
 print("\n%d passed, %d failed\n" % (PASS, FAIL))

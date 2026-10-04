@@ -48,6 +48,7 @@ import dedup_client
 import name_composer
 import payload_reader
 import zip_passthrough
+import nested_archive
 import disk_plan
 import firmware_facts
 
@@ -1824,7 +1825,15 @@ def process_archive(source_path: str, output_path: str, original_name: str,
     # (zip_passthrough.py) -- no 25% growth, no extraction, seconds not
     # minutes. Same files in the same places; anything it has not been proven
     # on falls through to the extract-and-store path below, unchanged.
+    # ADDED 2026-10-04: a zip that is only a wrapper around ONE more archive
+    # (a .rar inside the .zip) goes the unpack route below, so the stored zip
+    # holds the firmware itself and visitors unzip once (nested_archive.py).
+    nested = ""
     if not clean_output_path and zipfile.is_zipfile(source_path):
+        nested = nested_archive.zip_has_nested(source_path, should_exclude)
+        if nested:
+            print(f"  Archive inside the archive: {nested} -- unpacking it so visitors unzip once")
+    if not clean_output_path and zipfile.is_zipfile(source_path) and not nested:
         report_progress("processing", 81, "Checking archive contents...", force=True)
         locked = find_password_locked_in_zip(source_path)
         if locked:
@@ -1883,6 +1892,10 @@ def process_archive(source_path: str, output_path: str, original_name: str,
 
         # Flatten staging directory if there's a single top-level folder
         flatten_staging_dir(staging_dir)
+
+        # ADDED 2026-10-04: one archive inside -> its contents instead.
+        if nested_archive.unwrap_in_staging(staging_dir, should_exclude):
+            flatten_staging_dir(staging_dir)
 
         # Remove excluded files only -- NO renaming of internal filenames
         report_progress("processing", 83, "Removing exclusions...", force=True)
@@ -2287,6 +2300,19 @@ def main():
         # KH7N inside the KH7S firmware put "KH7N_" on the KH7S file
         # (2026-10-03).
         fw_facts = archive_facts(raw_path, entries, facts) if entries else {}
+        # A link straight to a Unisoc .pac (not zipped): its labels are inside it.
+        if not entries and original_name.lower().endswith(".pac"):
+            try:
+                def _read(_n, limit):
+                    with open(raw_path, "rb") as fh:
+                        return fh.read(limit)
+                fw_facts = firmware_facts.collect([original_name], _read, {},
+                                                  opener=lambda _n: open(raw_path, "rb"))
+                shown = [f"{k} {fw_facts[k]}" for k in ("android", "security_patch", "model") if fw_facts.get(k)]
+                print("  Card details: " + (", ".join(shown) if shown else "none found in the .pac"))
+            except Exception as e:
+                print(f"  Card details not read from the .pac ({e})")
+                fw_facts = {}
         naming_facts = dict(facts) if facts else None
         if naming_facts is not None and naming_facts.get("container") != "samsung_odin":
             naming_facts.pop("model_code", None)
@@ -2326,6 +2352,11 @@ def main():
         # ─── Step 4: Process the File ───
         is_archive = is_extractable_archive(raw_path, original_name)
         need = disk_plan.extra_needed(raw_size, entries, zipfile.is_zipfile(raw_path), is_archive)
+        # An archive inside the archive is unpacked twice (nested_archive.py).
+        inner_name = nested_archive.dominant_inner(
+            [(e.get("name", ""), int(e.get("size") or 0)) for e in (entries or [])], should_exclude)
+        if is_archive and inner_name:
+            need += raw_size * 2
         no_room = disk_plan.ensure_space(work_dir, need, "processing")
         if no_room:
             raise RuntimeError(no_room)
@@ -2342,6 +2373,18 @@ def main():
                                    add_branding=not SERVE_TIME_BRANDING)
 
         processed_size = os.path.getsize(processed_path)
+
+        # The details could not be read through an archive inside the archive;
+        # the finished zip holds the firmware itself, so read them from it.
+        if is_archive and inner_name and not fw_facts.get("model") and zipfile.is_zipfile(processed_path):
+            try:
+                out_entries = archive_entries(processed_path)
+                out_payload = payload_reader.read_payload(out_entries) if out_entries else {}
+                again = archive_facts(processed_path, out_entries, out_payload) if out_entries else {}
+                for k, v in again.items():
+                    fw_facts.setdefault(k, v)
+            except Exception as e:
+                print(f"  Card details from the finished zip not read ({e})")
         report_progress("processing", 85,
                         f"Processing complete ({processed_size // (1024*1024)} MB)", force=True)
 

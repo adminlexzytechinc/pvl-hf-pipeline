@@ -29,7 +29,13 @@ import struct
 import zlib
 
 CODE = re.compile(r'^[A-Z]{1,4}\d{1,5}[A-Z0-9]{0,4}$', re.I)
-GENERIC = re.compile(r'^(full|generic|tssi|aosp|qssi|mssi|sys_|system|gsi|mgvi|hal_|alps)', re.I)
+GENERIC = re.compile(r'^(full|generic|tssi|aosp|qssi|mssi|ussi|sys_|system|gsi|mgvi|hal_|alps)', re.I)
+# Words that are part of a model ("LA7 Pro") -- anything else after the code
+# ("X626B LTE") is not (2026-10-04).
+TIER_WORDS = {'pro', 'plus', 'max', 'lite', 'air', 'prime', 'neo', 'go', 'ultra', 'mini'}
+# Brands whose fingerprint names the model in its middle part:
+#   realme/RMX3933/RE6099, OPPO/CPH2219/OP4F7FL1
+PRODUCT_IS_MODEL = {'realme', 'oppo', 'oneplus'}
 FP_PARTS = ("dtbo", "vendor", "odm", "product", "system_ext", "boot", "vendor_boot", "system")
 MODEL_KEYS = ("ro.product.model", "ro.product.vendor.model", "ro.product.system.model",
               "ro.product.product.model", "ro.product.odm.model")
@@ -63,17 +69,54 @@ def from_fingerprint(fp):
     prod = product.split('-')[0]
     if CODE.match(prod) and dev and prod.upper().startswith(dev.upper()):
         return prod                    # LC7S over LC7, KH7S over KH7S
+    if not dev and brand.lower() in PRODUCT_IS_MODEL and CODE.match(prod):
+        return prod                    # realme/RMX3933/RE6099 -> RMX3933
     return dev if CODE.match(dev or '') else ''
+
+
+def _model_code(value, brand):
+    """'TECNO LA7 Pro' -> 'LA7 Pro'; 'Infinix X626B LTE' -> 'X626B'; '' when the
+    name does not start with a code ('Infinix NOTE 3 Pro')."""
+    words = _strip_brand(value, brand).split()
+    if not words or not CODE.match(words[0]):
+        return ''
+    keep = [words[0]]
+    for w in words[1:]:
+        if w.lower() not in TIER_WORDS:
+            break
+        keep.append(w)
+    return ' '.join(keep)
+
+
+def _branded_device(props, brand):
+    """The device code when it is written BRAND-CODE ('Infinix-X522',
+    'TECNO-LA7-13M'), else ''. A bare codename ('RE6099') is not a model."""
+    for k in DEVICE_KEYS:
+        v = (props.get(k) or '').strip()
+        d = _strip_brand(v, brand)
+        if d != v:
+            d = d.split('-')[0]
+            if CODE.match(d):
+                return d
+    return ''
 
 
 def from_props(props):
     """{key: value} from a .prop file -> (model, which key) or ('', '')."""
     brand = props.get('ro.product.brand') or props.get('ro.product.vendor.brand') or ''
+    dev = _branded_device(props, brand)
     for k in MODEL_KEYS:
-        m = _strip_brand(props.get(k), brand)
-        first = m.split(' ')[0] if m else ''
-        if CODE.match(first):
-            return m, k                # "AX8S", "LC7S", "LA7 Pro"
+        m = _model_code(props.get(k), brand)
+        if not m:
+            continue
+        # "Infinix S2" is the marketing name of the X522: when the name and
+        # the device code are unrelated, the device code names the phone.
+        # A name that extends the code (AX8S of AX8, LC7S of LC7, "LA7 Pro"
+        # of LA7) is the more exact one and is kept (2026-10-04).
+        norm = lambda x: re.sub(r'[^A-Z0-9]', '', x.upper())
+        if dev and not (norm(m).startswith(norm(dev)) or norm(dev).startswith(norm(m))):
+            return dev, k.replace('model', 'device')
+        return m, k                    # "AX8S", "LC7S", "LA7 Pro"
     for k in FP_KEYS:
         code = from_fingerprint(props.get(k))
         if code:
@@ -330,6 +373,70 @@ def from_images(leaves, opener):
     return '', ''
 
 
+# --- 4. Unisoc / Spreadtrum .pac (2026-10-04) -----------------------------------
+#
+# A .pac is a container: a header, then a table of files (one entry every
+# 2580 bytes from offset 2124, in both the R1.0.0 and R2.0.1 layouts seen on
+# itel P40 / Power 80 / VistaTab 11, Tecno KN3, realme RMX3933), each entry
+# holding a file id and name as UTF-16 text and the file's size and offset.
+# Only the vbmeta images are read -- a few KB -- never the gigabytes around
+# them. Their labels then go through the same rules as MediaTek's.
+
+PAC_FIRST, PAC_ENTRY = 2124, 2580
+
+
+def _wstr(b):
+    return b.decode('utf-16-le', errors='ignore').split('\x00')[0]
+
+
+def pac_vbmeta_blobs(f, max_entries=400):
+    """The vbmeta images inside a .pac (f: seekable file). [] when it is not
+    a .pac this reader understands -- never a guess."""
+    f.seek(0)
+    head = f.read(PAC_FIRST + PAC_ENTRY * max_entries)
+    if not _wstr(head[:48]).startswith('BP_R'):
+        return []
+    blobs = []
+    for i in range(PAC_FIRST, len(head) - PAC_ENTRY + 1, PAC_ENTRY):
+        e = head[i:i + PAC_ENTRY]
+        fid = _wstr(e[4:516])
+        if not fid:
+            break
+        name = _wstr(e[516:1028]).lower()
+        if 'vbmeta' not in name:
+            continue
+        vals = struct.unpack('<8I', e[1540:1572])
+        # Size and offset sit at slightly different places in R1 and R2;
+        # each candidate is accepted only when it lands on an AVB image.
+        for size, off in ((vals[0], vals[3]), (vals[0], vals[4]), (vals[1], vals[4])):
+            if 256 <= size <= (1 << 20) and off:
+                f.seek(off)
+                blob = f.read(min(size, 65536))
+                if blob[:4] == b'AVB0':
+                    blobs.append(blob)
+                    break
+    return blobs
+
+
+def pac_member(leaves):
+    for leaf, name in leaves.items():
+        if leaf.endswith('.pac'):
+            return name
+    return ''
+
+
+# --- 5. a loose build.prop beside the firmware (realme ships one) ---------------
+
+def loose_build_prop(leaves, read):
+    name = leaves.get('build.prop')
+    if not name:
+        return {}
+    try:
+        return parse_props((read(name, 262144) or b'').decode('latin-1'))
+    except Exception:
+        return {}
+
+
 # --- all of it ----------------------------------------------------------------
 
 def real_model(leaves, read, fingerprints, opener=None):
@@ -345,11 +452,13 @@ def real_model(leaves, read, fingerprints, opener=None):
         code = from_fingerprint(fingerprints.get(part))
         if code:
             return code, 'vbmeta %s label' % part
-    for step in (lambda: from_recovery(leaves, read), lambda: from_images(leaves, opener)):
+    for step in (lambda: from_props(loose_build_prop(leaves, read)),
+                 lambda: from_recovery(leaves, read), lambda: from_images(leaves, opener)):
         try:
             m, src = step()
         except Exception:
             m, src = '', ''
         if m:
-            return m, src
+            return m, (src if src.startswith(('recovery', 'ramdisk', 'super', 'vendor.img', 'system.img'))
+                       else 'build.prop ' + src)
     return '', ''

@@ -85,7 +85,24 @@ def avb_properties(blob):
     return out
 
 
+# The phone's own software: on newer Unisoc phones "system" is a shared base
+# that reports an older Android (Tecno KN3: system 13, product 15 -- the phone
+# runs 15), so the newest of these wins (2026-10-04).
+MAIN_PARTS = ('system', 'product', 'system_ext')
+
+
+def _num(v):
+    return tuple(int(x) for x in re.findall(r'\d+', v))
+
+
 def _android_from_props(props):
+    best = None
+    for part in MAIN_PARTS:
+        v = props.get((part, 'os_version'))
+        if v and re.match(r'^\d{1,2}(\.\d)?$', v) and (best is None or _num(v) > _num(best[0])):
+            best = (v, 'vbmeta %s.os_version' % part)
+    if best:
+        return best
     for part in PROP_PARTS:
         v = props.get((part, 'os_version'))
         if v and re.match(r'^\d{1,2}(\.\d)?$', v):
@@ -99,6 +116,13 @@ def _android_from_props(props):
 
 
 def _patch_from_props(props):
+    best = None
+    for part in MAIN_PARTS:
+        v = props.get((part, 'security_patch'))
+        if v and PATCH_OK.match(v) and (best is None or v > best[0]):
+            best = (v, 'vbmeta %s.security_patch' % part)
+    if best:
+        return best
     for part in PROP_PARTS:
         v = props.get((part, 'security_patch'))
         if v and PATCH_OK.match(v):
@@ -148,6 +172,17 @@ def collect(names, read, payload=None, opener=None):
                 props.update({k: v for k, v in avb_properties(read(leaves[leaf], 65536)).items() if k not in props})
             except Exception:
                 pass
+    # Unisoc .pac: its vbmeta images sit inside the .pac (2026-10-04).
+    if not props and opener:
+        pac = model_reader.pac_member(leaves)
+        if pac:
+            try:
+                f = opener(pac)
+                for blob in (model_reader.pac_vbmeta_blobs(f) if f else []):
+                    props.update({k: v for k, v in avb_properties(blob).items() if k not in props})
+            except Exception:
+                pass
+
     if 'model' not in facts and payload.get('container') != 'samsung_odin':
         fps = {part: v for (part, key), v in props.items() if key == 'fingerprint'}
         try:
@@ -175,6 +210,16 @@ def collect(names, read, payload=None, opener=None):
                 if not patch and h.get('patch'):
                     patch, p_src = h['patch'], '%s header' % leaf
             break
+
+    # --- a loose build.prop (realme ships one beside the .pac) -----------
+    if not android or not patch:
+        bp = model_reader.loose_build_prop(leaves, read)
+        v = bp.get('ro.build.version.release') or bp.get('ro.system.build.version.release')
+        if not android and v and re.match(r'^\d{1,2}(\.\d)?$', v):
+            android, a_src = v, 'build.prop'
+        v = bp.get('ro.build.version.security_patch')
+        if not patch and v and PATCH_OK.match(v):
+            patch, p_src = v, 'build.prop'
 
     # --- Samsung --------------------------------------------------------
     if payload.get('container') == 'samsung_odin':
