@@ -707,7 +707,11 @@ def download_file(file_id: str, dest_path: str) -> bool:
             print(f"  Retrying Google Drive cascade (pass {attempt}/2)...")
             time.sleep(3)
 
-        for name, pct, method in methods:
+        order = list(methods)
+        i = 0
+        while i < len(order):
+            name, pct, method = order[i]
+            i += 1
             # ADDED 2026-09-26: a file Google refused in every slice is not
             # asked again on the second pass -- that was 10 more minutes of
             # runner time for the same answer (MegaPad 11 run, 2026-09-25).
@@ -737,6 +741,18 @@ def download_file(file_id: str, dest_path: str) -> bool:
                     except Exception:
                         pass
                     print(f"  Discarded corrupt file, falling through to next download method...")
+
+            # ADDED 2026-10-04: Google answered the signed URL with 429 (too
+            # many requests). Slices then tend to stall part-way -- the Spark 9
+            # Pro run of 2026-10-03 got 51%, then waited the full 10 minutes
+            # before the GAS copy fetched the file in about a minute. So after
+            # a 429 the GAS copy goes next; slices still follow if it fails.
+            if name == "Signed URL" and LAST_HTTP_STATUS == 429:
+                rest = order[i:]
+                gas = [m for m in rest if m[0] == "GAS copy"]
+                if gas and rest[0][0] != "GAS copy":
+                    print("  Google answered 429 (too many requests): trying the GAS copy before slices")
+                    order[i:] = gas + [m for m in rest if m[0] != "GAS copy"]
 
     return False
 
@@ -1292,8 +1308,16 @@ def api_download(file_id: str, dest_path: str) -> bool:
         return False
 
 
+# The HTTP status of the last stream_download() request (2026-10-04). The
+# Drive cascade reads it: a 429 on the signed URL sends it to the GAS copy
+# before slices.
+LAST_HTTP_STATUS = 0
+
+
 def stream_download(url: str, dest_path: str, auth: str = None, params: dict = None) -> bool:
     """Stream a URL to a local file. Reports progress during download."""
+    global LAST_HTTP_STATUS
+    LAST_HTTP_STATUS = 0
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     if auth:
         headers["Authorization"] = auth
@@ -1304,6 +1328,7 @@ def stream_download(url: str, dest_path: str, auth: str = None, params: dict = N
         print(f"  Stream request failed: {e}")
         return False
 
+    LAST_HTTP_STATUS = resp.status_code
     if resp.status_code != 200:
         print(f"  Download returned HTTP status {resp.status_code}")
         return False
