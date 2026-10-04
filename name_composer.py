@@ -317,6 +317,18 @@ def samsung_build_code(file_names):
     return ap + ('_' + csc if csc and csc != ap else '')
 
 
+# Hovatek wraps the vendor's build string in brackets:
+#   Tecno_Spark_9_Pro_(KH7-H6919ABC-S-OP-220826V539)
+# The brackets are unwrapped when they hold ONE code (letters and digits, no
+# spaces), so the stored name reads Tecno_Spark_9_Pro_KH7-H6919ABC-...
+# Brackets around words, "(Dead Recovery Fix)", are left alone (2026-10-04).
+_WRAPPED_CODE = re.compile(r'\(([A-Za-z0-9][A-Za-z0-9._+-]*\d[A-Za-z0-9._+-]*)\)')
+
+
+def _unwrap_code(name):
+    return _WRAPPED_CODE.sub(lambda m: m.group(1), (name or '').strip())
+
+
 def vendor_base(outer_base, root_base='', samsung_code=''):
     """
     The vendor's own name for the build, from the outer archive name (already
@@ -331,8 +343,8 @@ def vendor_base(outer_base, root_base='', samsung_code=''):
         code read from the AP and CSC files inside (samsung_build_code()).
     Returns '' when neither carries any identity.
     """
-    outer_base = (outer_base or '').strip()
-    root_base = (root_base or '').strip()
+    outer_base = _unwrap_code(outer_base)
+    root_base = _unwrap_code(root_base)
     # A Samsung package whose outer name lacks the full AP build code is named
     # by the code itself; a name that already carries it is left alone.
     if samsung_code:

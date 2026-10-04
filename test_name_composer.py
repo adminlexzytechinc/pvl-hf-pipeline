@@ -148,5 +148,12 @@ for base, want in [("rom file", False), ("Stock ROM", False), ("Firmware", False
                    ("G556BXXS9.0", True), ("Tecno Pouvoir 1 LA6 MT6580 7.0 Dead Recovery", True)]:
     ok(nc.carries_identity(base) is want, "%r carries identity: %s" % (base, want))
 
+print("\n== Hovatek's brackets (2026-10-04) ==")
+for raw, want in (("Tecno_Spark_9_Pro_(KH7-H6919ABC-S-OP-220826V539)", "Tecno_Spark_9_Pro_KH7-H6919ABC-S-OP-220826V539"),
+                  ("Tecno Pouvoir 4 (LC7-H6116BCF-Q-GL-200701V308)", "Tecno Pouvoir 4 LC7-H6116BCF-Q-GL-200701V308"),
+                  ("Tecno Pouvoir 1 LA6 (Dead Recovery Fix)", "Tecno Pouvoir 1 LA6 (Dead Recovery Fix)"),
+                  ("KH7-H6919ABC-S-OP-220331V261", "KH7-H6919ABC-S-OP-220331V261")):
+    ok(nc.vendor_base(raw) == want, "%r -> %r" % (raw, want), nc.vendor_base(raw))
+
 print("\n%d passed, %d failed\n" % (PASS, FAIL))
 sys.exit(0 if FAIL == 0 else 1)
